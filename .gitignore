@@ -1,0 +1,11 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+target/
+.runtime/
+reports/
+MUJOCO_LOG.TXT
