@@ -19,7 +19,7 @@ pub struct Limits {
 }
 
 // Pinned openarm_can MOTOR_LIMIT_PARAMS: DM8009, DM4340, DM4310.
-// Python conformance tests compare every family with the actual official encoder.
+// Golden vectors below were captured from the official 1.4.0 encoder.
 pub fn limits(joint: usize) -> Limits {
     let (velocity, torque) = match joint {
         1 | 2 => (45., 54.),
@@ -162,6 +162,61 @@ impl Motor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_encoder_vectors_and_registers() {
+        #[derive(Deserialize)]
+        struct Vector {
+            joint: usize,
+            packet: [u8; 8],
+            command: Command,
+        }
+        #[derive(Deserialize)]
+        struct Vectors {
+            vectors: Vec<Vector>,
+        }
+        let vectors: Vectors =
+            serde_json::from_str(include_str!("../tests/data/mit_commands.json")).unwrap();
+        for vector in vectors.vectors {
+            let mut motor = Motor::new(vector.joint);
+            motor.receive(vector.joint as u32, &vector.packet).unwrap();
+            let (got, want) = (motor.command, vector.command);
+            for (got, want, step) in [
+                (got.q, want.q, 25. / 65535.),
+                (got.dq, want.dq, 2. * motor.limits.velocity / 4095.),
+                (got.tau, want.tau, 2. * motor.limits.torque / 4095.),
+                (got.kp, want.kp, 500. / 4095.),
+                (got.kd, want.kd, 5. / 4095.),
+            ] {
+                assert!((got - want).abs() <= step + 1e-5, "{got} != {want}");
+            }
+        }
+        let mut motor = Motor::new(7);
+        for (register, value) in [
+            (7, 23u32.to_le_bytes()),
+            (8, 7u32.to_le_bytes()),
+            (9, 0u32.to_le_bytes()),
+            (10, 1u32.to_le_bytes()),
+            (21, 12.5f32.to_le_bytes()),
+            (22, 30f32.to_le_bytes()),
+            (23, 10f32.to_le_bytes()),
+        ] {
+            let reply = motor
+                .receive(0x7ff, &[7, 0, 0x33, register, 0, 0, 0, 0])
+                .unwrap()
+                .unwrap();
+            assert_eq!(&reply[4..], &value);
+        }
+        for packet in [
+            [7, 0, 0x55, 54, 0, 0, 0, 0],
+            [7, 0, 0x55, 10, 2, 0, 0, 0],
+            [7, 0, 0x33, 255, 0, 0, 0, 0],
+            [7, 0, 0xaa, 0, 0, 0, 0, 0],
+        ] {
+            assert!(motor.receive(0x7ff, &packet).is_err());
+            assert_eq!(motor.status, 0);
+        }
+    }
 
     #[test]
     fn golden_packet_and_latched_fault() {

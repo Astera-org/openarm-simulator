@@ -5,22 +5,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use socketcan::id::FdFlags;
 use socketcan::{
-    CanFdFrame, CanFdSocket, CanFilter, EmbeddedFrame, Frame, Socket, SocketOptions, StandardId,
+    CanFdFrame, CanFdSocket, CanFilter, CanSocket, EmbeddedFrame, Frame, Socket, SocketOptions,
+    StandardId,
 };
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     process::Command,
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+    },
+    time::{Duration, Instant},
 };
 
-const INTERFACES: [&str; 2] = ["can0", "can1"];
 const RECEIVE_BUDGET: usize = 64;
 
-pub fn require_virtual_interfaces() -> Result<()> {
+fn require_virtual_interfaces(interfaces: &[String; 2]) -> Result<Vec<u32>> {
     // Check BOTH interfaces before opening either socket, including direct
     // native invocation. Never trust OPENARM_SIMULATION as proof of isolation.
-    for name in INTERFACES {
+    ensure!(
+        interfaces[0] != interfaces[1] && interfaces.iter().all(|s| !s.is_empty()),
+        "expected two distinct virtual CAN interfaces"
+    );
+    let mut indexes = Vec::new();
+    for name in interfaces {
         let result = Command::new("ip")
             .args(["-j", "-d", "link", "show", "dev", name])
             .output()?;
@@ -30,8 +39,32 @@ pub fn require_virtual_interfaces() -> Result<()> {
             virtual_link(&links),
             "{name} must be CAN-FD capable vcan; refusing a physical interface"
         );
+        indexes.push(u32::try_from(
+            links[0]["ifindex"]
+                .as_u64()
+                .context("missing interface index")?,
+        )?);
     }
-    Ok(())
+    Ok(indexes)
+}
+
+fn netns_cookie(fd: RawFd) -> Result<u64> {
+    let mut cookie = 0u64;
+    let mut length = size_of::<u64>() as libc::socklen_t;
+    ensure!(
+        unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NETNS_COOKIE,
+                (&mut cookie as *mut u64).cast(),
+                &mut length,
+            )
+        } == 0,
+        "cannot inspect socket network namespace: {}",
+        io::Error::last_os_error()
+    );
+    Ok(cookie)
 }
 
 fn virtual_link(links: &Value) -> bool {
@@ -80,72 +113,68 @@ impl Timer {
     }
 }
 
-// Inherited Unix SEQPACKET socket: message boundaries, bounded/nonblocking I/O,
-// and EOF when the launcher disappears. JSON is only for administrative calls.
-pub struct Admin(OwnedFd);
-impl Admin {
-    /// The caller transfers its inherited descriptor exactly once.
-    pub unsafe fn from_fd(fd: RawFd) -> Self {
-        Self(unsafe { OwnedFd::from_raw_fd(fd) })
+// Bounded messages cross into the physics thread; socket I/O never blocks it.
+type Call = (Request, mpsc::Sender<Result<Value>>);
+
+#[derive(Debug)]
+pub struct Unavailable(&'static str);
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
     }
-    fn send(&self, value: Value) -> Result<()> {
-        let bytes = serde_json::to_vec(&value)?;
-        let n = unsafe {
-            libc::send(
-                self.0.as_raw_fd(),
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
-        ensure!(
-            n == bytes.len() as isize,
-            "admin send: {}",
-            io::Error::last_os_error()
-        );
-        Ok(())
+}
+impl std::error::Error for Unavailable {}
+
+#[derive(Clone)]
+pub struct Control(SyncSender<Call>);
+impl Control {
+    pub fn channel() -> (Self, Receiver<Call>) {
+        let (sender, receiver) = mpsc::sync_channel(32);
+        (Self(sender), receiver)
     }
-    fn read(&self) -> Result<Option<Request>> {
-        let mut bytes = [0u8; 32768];
-        let n = unsafe {
-            libc::recv(
-                self.0.as_raw_fd(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-                libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-            )
-        };
-        ensure!(
-            n >= 0 && n as usize <= bytes.len(),
-            "invalid admin packet: {}",
-            io::Error::last_os_error()
-        );
-        if n == 0 {
-            return Ok(None);
+    pub fn call(&self, message: Value) -> Result<Value> {
+        if matches!(message["action"].as_str(), Some("push" | "reset")) {
+            ensure!(
+                message["payload"].is_object(),
+                "payload must be an object keyed by arm"
+            );
         }
-        Ok(Some(serde_json::from_slice(&bytes[..n as usize])?))
+        if message["action"] == "fault" {
+            ensure!(
+                message["payload"][2].is_object(),
+                "fault settings must be an object"
+            );
+        }
+        let request = serde_json::from_value(message)?;
+        let (send, receive) = mpsc::channel();
+        self.0
+            .try_send((request, send))
+            .map_err(|_| Unavailable("simulator busy or stopped"))?;
+        receive
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| Unavailable("simulator stopped responding"))?
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Fault {
+pub struct Fault {
     status: Option<u8>,
     silent: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
+pub enum Request {
     Inspect,
     Fault { payload: (String, usize, Fault) },
     Push { payload: Arms<[f64; 7]> },
     Reset { payload: Arms<Pose> },
-    Quit,
+    Configuration,
 }
 
 fn administer(physics: &mut Physics, request: Request) -> Result<()> {
     match request {
-        Request::Inspect | Request::Quit => (),
+        Request::Inspect | Request::Configuration => (),
         Request::Reset { payload } => physics.reset(payload)?,
         Request::Push { payload } => physics.push([
             payload.right.unwrap_or([0.; 7]),
@@ -241,40 +270,98 @@ fn receive(
     Ok(())
 }
 
-pub fn run(mut physics: Physics, admin: Admin) -> Result<()> {
-    require_virtual_interfaces()?;
+pub fn can_sockets(interfaces: &[String; 2], fds: [Option<RawFd>; 2]) -> Result<Vec<CanFdSocket>> {
+    let indexes = require_virtual_interfaces(interfaces)?;
+    let current_namespace = if fds.iter().any(Option::is_some) {
+        let probe =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        ensure!(probe >= 0, "socket: {}", io::Error::last_os_error());
+        let probe = unsafe { OwnedFd::from_raw_fd(probe) };
+        Some(netns_cookie(probe.as_raw_fd())?)
+    } else {
+        None
+    };
     let filters: Vec<_> = std::iter::once(0x7ff)
         .chain((0..4).flat_map(|mode| (1..=8).map(move |id| mode * 0x100 + id)))
         // EFF/RTR flags must be clear. CAN_ERR_FLAG is NOT part of a data filter.
         .map(|id| CanFilter::new(id, 0xc00007ff))
         .collect();
-    let sockets: Vec<_> = INTERFACES
+    interfaces
         .iter()
-        .map(|name| -> Result<_> {
-            let bus = CanFdSocket::open(name).with_context(|| format!("open virtual {name}"))?;
+        .enumerate()
+        .map(|(side, name)| -> Result<_> {
+            let bus = if let Some(fd) = fds[side] {
+                let socket = CanSocket::from(unsafe { OwnedFd::from_raw_fd(fd) });
+                let raw = socket.as_raw_socket();
+                ensure!(
+                    raw.domain()? == libc::AF_CAN.into() && raw.r#type()? == libc::SOCK_RAW.into(),
+                    "expected a CAN_RAW socket for {name}"
+                );
+                // Interface indexes are namespace-local. Never validate a foreign
+                // socket against an unrelated vcan with the same local index.
+                ensure!(
+                    Some(netns_cookie(socket.as_raw_fd())?) == current_namespace,
+                    "inherited CAN sockets must belong to the simulator network namespace"
+                );
+                let address = raw.local_addr()?;
+                ensure!(
+                    address.len() as usize
+                        >= std::mem::offset_of!(libc::sockaddr_can, can_ifindex)
+                            + size_of::<libc::c_int>(),
+                    "missing CAN socket address"
+                );
+                let index = unsafe { (*address.as_ptr().cast::<libc::sockaddr_can>()).can_ifindex };
+                ensure!(
+                    index > 0 && index as u32 == indexes[side],
+                    "inherited CAN socket must be bound to {name}"
+                );
+                // Linux can report SO_PROTOCOL=0 for CAN_RAW. Enabling its
+                // CAN_RAW_FD_FRAMES option also verifies the protocol here.
+                CanFdSocket::try_from(socket)?
+            } else {
+                CanFdSocket::open(name).with_context(|| format!("open virtual {name}"))?
+            };
             bus.set_nonblocking(true)?;
+            bus.set_loopback(true)?;
+            bus.set_recv_own_msgs(false)?;
+            bus.set_join_filters(false)?;
+            bus.set_error_filter_drop_all()?;
             bus.set_filters(&filters)?;
             Ok(bus)
         })
-        .collect::<Result<_>>()?;
+        .collect()
+}
+
+fn snapshot(physics: &Physics, stats: &Statistics, identity: &Value) -> Value {
+    json!({"state": physics.snapshot(), "statistics": stats, "time": physics.time(),
+        "mujoco_version": Physics::version(), "timestep_s": STEP,
+        "plant": physics.parameters(), "config_sha256": identity["config_sha256"],
+        "joint_stop_solref": [0.002,1.], "joint_stop_solimp": [0.99,0.999,0.001,0.5,2.]})
+}
+
+pub fn run(
+    physics: &mut Physics,
+    calls: Receiver<Call>,
+    sockets: Vec<CanFdSocket>,
+    parent: Option<OwnedFd>,
+    stopped: &AtomicBool,
+    identity: &Value,
+) -> Result<Value> {
     let timer = Timer::new()?;
     let started = Instant::now();
     let mut stats = Statistics::default();
-    admin.send(json!({"ready": true, "mujoco_version": Physics::version(),
-                      "configuration": physics.configuration()}))?;
-    let mut pollers: Vec<_> = [
+    let mut pollers = [
         timer.0.as_raw_fd(),
-        admin.0.as_raw_fd(),
         sockets[0].as_raw_fd(),
         sockets[1].as_raw_fd(),
+        parent.as_ref().map_or(-1, AsRawFd::as_raw_fd),
     ]
     .map(|fd| libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
-    })
-    .into();
-    loop {
+    });
+    while !stopped.load(Ordering::Relaxed) {
         let ready = unsafe { libc::poll(pollers.as_mut_ptr(), pollers.len() as _, -1) };
         if ready < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -282,8 +369,19 @@ pub fn run(mut physics: Physics, admin: Admin) -> Result<()> {
             }
             bail!("poll: {}", io::Error::last_os_error());
         }
-        // Step BEFORE taking new commands so catch-up cannot apply a freshly
-        // arrived command retroactively to all overdue physics steps.
+        if pollers[3].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let mut byte = 0u8;
+            let count = unsafe { libc::read(pollers[3].fd, (&mut byte as *mut u8).cast(), 1) };
+            if count == 0 {
+                break;
+            }
+            ensure!(
+                count == 1,
+                "parent descriptor: {}",
+                io::Error::last_os_error()
+            );
+        }
+        // Catch up BEFORE new commands, so they cannot affect past steps.
         if pollers[0].revents & libc::POLLIN != 0 {
             let count = timer.ticks()?;
             stats.max_lag_ms = stats
@@ -293,25 +391,19 @@ pub fn run(mut physics: Physics, admin: Admin) -> Result<()> {
             stats.steps += count;
             stats.max_catchup_steps = stats.max_catchup_steps.max(count);
         }
-        if pollers[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let result = match admin.read() {
-                Ok(None | Some(Request::Quit)) => break,
-                Ok(Some(request)) => administer(&mut physics, request),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                admin.send(json!({"error": error.to_string()}))?;
-            } else {
-                admin.send(json!({"state": physics.snapshot(), "statistics": stats, "time": physics.time(),
-                              "mujoco_version": Physics::version(), "timestep_s": STEP,
-                              "plant": physics.parameters(),
-                              "joint_stop_solref": [0.002,1.], "joint_stop_solimp": [0.99,0.999,0.001,0.5,2.]}))?;
+        for (side, bus) in sockets.iter().enumerate() {
+            if pollers[side + 1].revents & libc::POLLIN != 0 {
+                receive(bus, side, physics, &mut stats)?;
             }
         }
-        for side in 0..2 {
-            if pollers[side + 2].revents & libc::POLLIN != 0 {
-                receive(&sockets[side], side, &mut physics, &mut stats)?;
-            }
+        // At most two administrative calls per tick, even under continuous load.
+        for (request, reply) in calls.try_iter().take(2) {
+            let result = if matches!(request, Request::Configuration) {
+                Ok(identity.clone())
+            } else {
+                administer(physics, request).map(|()| snapshot(physics, &stats, identity))
+            };
+            let _ = reply.send(result);
         }
         ensure!(
             pollers
@@ -320,7 +412,7 @@ pub fn run(mut physics: Physics, admin: Admin) -> Result<()> {
             "simulator descriptor failed"
         );
     }
-    Ok(())
+    Ok(snapshot(physics, &stats, identity))
 }
 
 #[cfg(test)]

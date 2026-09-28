@@ -148,12 +148,47 @@ pub struct Physics {
     pub motors: [[Motor; 8]; 2],
 }
 
+pub fn model_sha256(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    ensure!(
+        unsafe { ffi::mj_version() } == ffi::mjVERSION_HEADER as i32,
+        "MuJoCo runtime/header version mismatch"
+    );
+    let path = CString::new(path.as_os_str().as_encoded_bytes())?;
+    let mut error = [0i8; 2048];
+    let raw = unsafe {
+        ffi::mj_loadXML(
+            path.as_ptr(),
+            std::ptr::null(),
+            error.as_mut_ptr(),
+            error.len() as i32,
+        )
+    };
+    let model = Model(NonNull::new(raw).with_context(|| unsafe {
+        CStr::from_ptr(error.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    })?);
+    // Compiled model includes referenced XML and meshes, independent of paths.
+    let size = unsafe { ffi::mj_sizeModel(model.0.as_ptr()) };
+    let mut bytes = vec![0u8; usize::try_from(size)?];
+    unsafe {
+        ffi::mj_saveModel(
+            model.0.as_ptr(),
+            std::ptr::null(),
+            bytes.as_mut_ptr().cast(),
+            i32::try_from(size)?,
+        );
+    }
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
 impl Physics {
     pub fn load(path: &Path, config: Config) -> Result<Self> {
         // Check the ABI before accessing any generated struct fields.
         ensure!(
             unsafe { ffi::mj_version() } == ffi::mjVERSION_HEADER as i32,
-            "MuJoCo runtime/header version mismatch; rebuild with uv's current MuJoCo"
+            "MuJoCo runtime/header version mismatch; rebuild with matching MuJoCo headers and library"
         );
         let mut error = [0i8; 2048];
         let path = CString::new(path.as_os_str().as_encoded_bytes())?;
@@ -620,7 +655,6 @@ impl Physics {
 
     pub fn configuration(&self) -> serde_json::Value {
         // Fixed plant identity excludes pose, elapsed time and transient pushes.
-        // The Python adapter adds the pinned XML digest before hashing it.
         let m = unsafe { self.model.0.as_ref() };
         serde_json::json!({
             "friction_model": "mujoco-dry-viscous-with-optional-stribeck-v1",
@@ -665,55 +699,13 @@ impl Physics {
                 .collect()
         }
     }
-
-    pub fn contacts(&self) -> usize {
-        unsafe {
-            let d = self.data.0.as_ref();
-            slice::from_raw_parts(d.contact, d.ncon as usize)
-                .iter()
-                .filter(|c| c.dist <= 0. && c.efc_address >= 0)
-                .count()
-        }
-    }
-
-    pub fn truth(&mut self) -> serde_json::Value {
-        // Evaluation channel only. No truth fields appear in experiment samples.
-        unsafe {
-            let m = self.model.0.as_ref();
-            let d = self.data.0.as_mut();
-            let velocity = slice::from_raw_parts(d.qvel, m.nv as usize).to_vec();
-            slice::from_raw_parts_mut(d.qvel, m.nv as usize).fill(0.);
-            ffi::mj_forward(self.model.0.as_ptr(), self.data.0.as_ptr());
-            let gravity: Vec<Vec<f64>> = self
-                .index
-                .iter()
-                .map(|ix| {
-                    ix.dof[..7]
-                        .iter()
-                        .map(|i| *(*self.data.0.as_ptr()).qfrc_bias.add(*i))
-                        .collect()
-                })
-                .collect();
-            slice::from_raw_parts_mut((*self.data.0.as_ptr()).qvel, m.nv as usize)
-                .copy_from_slice(&velocity);
-            ffi::mj_forward(self.model.0.as_ptr(), self.data.0.as_ptr());
-            serde_json::json!({"gravity": gravity, "bodies": self.body_parameters(), "plant": self.parameters()})
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn world(config: Config) -> Physics {
-        Physics::load(
-            &std::path::PathBuf::from(
-                std::env::var_os("OPENARM_SIMULATOR_MODEL")
-                    .expect("set OPENARM_SIMULATOR_MODEL to an OpenArm v1 scene.xml"),
-            ),
-            config,
-        )
-        .unwrap()
+        Physics::load(std::path::Path::new(openarm_test_model::SCENE), config).unwrap()
     }
 
     #[test]
@@ -857,10 +849,7 @@ mod tests {
 
     #[test]
     fn reject_invalid_joint_parameters() {
-        let path = std::path::PathBuf::from(
-            std::env::var_os("OPENARM_SIMULATOR_MODEL")
-                .expect("set OPENARM_SIMULATOR_MODEL to an OpenArm v1 scene.xml"),
-        );
+        let path = std::path::Path::new(openarm_test_model::SCENE);
         for (name, value) in [
             ("openarm_right_joint4", -0.1),
             ("openarm_right_finger_joint1", 0.1),
@@ -875,7 +864,7 @@ mod tests {
                 )]),
                 ..Config::default()
             };
-            assert!(Physics::load(&path, config).is_err());
+            assert!(Physics::load(path, config).is_err());
         }
     }
 
