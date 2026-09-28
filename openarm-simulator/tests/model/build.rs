@@ -9,7 +9,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPENARM_SIMULATOR_MODEL");
     let source = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let scene = env::var_os("OPENARM_SIMULATOR_MODEL")
-        .map(|path| source.join("../..").join(path))
+        .map(|path| source.join("../../..").join(path))
         .unwrap_or_else(|| {
             let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
             let revision = "56e846b34d8a5bcea1bcebf93db5dc9da467d3c8";

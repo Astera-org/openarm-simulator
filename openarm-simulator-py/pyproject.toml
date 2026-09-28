@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openarm-simulator-py"
+version = "0.1.0"
+description = "Typed Python client for the OpenArm simulator control API"
+requires-python = ">=3.12"
+dependencies = ["pyserde>=0.31,<0.32"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openarm_simulator"]

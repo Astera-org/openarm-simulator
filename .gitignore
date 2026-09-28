@@ -2,3 +2,7 @@ target/
 .runtime/
 reports/
 MUJOCO_LOG.TXT
+.venv/
+__pycache__/
+*.egg-info/
+dist/
