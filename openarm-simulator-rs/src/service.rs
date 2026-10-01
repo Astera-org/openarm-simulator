@@ -1,11 +1,8 @@
 //! Single-threaded physics/CAN owner. Pausing time never pauses socket I/O.
-use crate::motor::V1_REPLY_ID_OFFSET;
 use crate::{clock::Clock, physics::Physics, simulation::Simulation};
 use anyhow::{Context, Result, bail, ensure};
 use damiao_can_rs::{MotorStatus, REGISTER_CAN_ID};
-use openarm_simulator_core_rs::{
-    Advance, Arm, Configuration, FaultRequest, Push, State, Statistics,
-};
+use openarm_simulator_core_rs::{Advance, Configuration, FaultRequest, Push, State, Statistics};
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
@@ -31,12 +28,17 @@ use std::{
 // Not a CAN queue capacity or a controller protocol requirement.
 const RECEIVE_BUDGET: usize = 64;
 
-fn require_virtual_interfaces(interfaces: &[String; 2]) -> Result<Vec<u32>> {
-    // Check BOTH interfaces before opening either socket, including direct
+fn require_virtual_interfaces(interfaces: &[String]) -> Result<Vec<u32>> {
+    // Check all interfaces before opening any socket, including direct
     // native invocation. Never trust OPENARM_SIMULATION as proof of isolation.
     ensure!(
-        interfaces[0] != interfaces[1] && interfaces.iter().all(|s| !s.is_empty()),
-        "expected two distinct virtual CAN interfaces"
+        interfaces.iter().all(|s| !s.is_empty())
+            && interfaces
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == interfaces.len(),
+        "expected distinct virtual CAN interfaces"
     );
     let mut indexes = Vec::new();
     for name in interfaces {
@@ -211,20 +213,15 @@ fn administer(physics: &mut Simulation, request: Request) -> Result<()> {
             payload.left.unwrap_or([0.; 7]),
         ])?,
         Request::Fault {
-            payload: (side, joint, fault),
+            payload: (name, fault),
         } => {
-            let side = match side {
-                Arm::Right => 0,
-                Arm::Left => 1,
-            };
-            ensure!((1..=8).contains(&joint), "invalid fault joint");
             if let Some(status) = fault.status {
                 ensure!(
                     status.0 <= 15 && status != MotorStatus::ENABLED,
                     "fault status must be 0 or 2..15; enable motors through CAN"
                 );
             }
-            let motor = &mut physics.motors[side][joint - 1];
+            let motor = physics.motor_mut(&name)?;
             if let Some(status) = fault.status {
                 motor.status = status;
             }
@@ -251,21 +248,26 @@ fn receive(
         };
         stats.commands += 1;
         let (id, data) = (frame.raw_id(), frame.data());
-        let joint = if id == REGISTER_CAN_ID && data.len() >= 2 {
+        let address = if id == REGISTER_CAN_ID && data.len() >= 2 {
             u16::from_le_bytes([data[0], data[1]]) as u32
         } else {
             id
         };
-        if !(1..=8).contains(&joint) {
+        let Some(index) = physics
+            .bindings
+            .iter()
+            .zip(&physics.motors)
+            .position(|(binding, motor)| binding.bus == side && u32::from(motor.id()) == address)
+        else {
             continue;
-        }
-        let motor = &mut physics.motors[side][joint as usize - 1];
+        };
+        let motor = &mut physics.motors[index];
         let Ok(reply) = motor.receive(id, data) else {
             continue;
         };
         if let Some(reply) = reply.filter(|_| !motor.silent) {
             let frame = CanFdFrame::with_flags(
-                StandardId::new(joint as u16 + V1_REPLY_ID_OFFSET).unwrap(),
+                StandardId::new(motor.reply_id()).unwrap(),
                 &reply,
                 FdFlags::BRS,
             )
@@ -285,7 +287,11 @@ fn receive(
     Ok(())
 }
 
-pub fn can_sockets(interfaces: &[String; 2], fds: [Option<RawFd>; 2]) -> Result<Vec<CanFdSocket>> {
+pub fn can_sockets(
+    interfaces: &[String],
+    fds: &[Option<RawFd>],
+    simulation: &Simulation,
+) -> Result<Vec<CanFdSocket>> {
     let indexes = require_virtual_interfaces(interfaces)?;
     let current_namespace = if fds.iter().any(Option::is_some) {
         let probe =
@@ -296,20 +302,27 @@ pub fn can_sockets(interfaces: &[String; 2], fds: [Option<RawFd>; 2]) -> Result<
     } else {
         None
     };
-    let filters: Vec<_> = std::iter::once(REGISTER_CAN_ID)
-        .chain(1..=8)
-        // EFF/RTR flags must be clear. CAN_ERR_FLAG is NOT part of a data filter.
-        .map(|id| {
-            CanFilter::new(
-                id,
-                libc::CAN_EFF_FLAG | libc::CAN_RTR_FLAG | libc::CAN_SFF_MASK,
-            )
-        })
-        .collect();
     interfaces
         .iter()
         .enumerate()
         .map(|(side, name)| -> Result<_> {
+            let filters: Vec<_> = std::iter::once(REGISTER_CAN_ID)
+                .chain(
+                    simulation
+                        .bindings
+                        .iter()
+                        .zip(&simulation.motors)
+                        .filter(|(binding, _)| binding.bus == side)
+                        .map(|(_, motor)| u32::from(motor.id())),
+                )
+                // EFF/RTR flags must be clear. CAN_ERR_FLAG is NOT part of a data filter.
+                .map(|id| {
+                    CanFilter::new(
+                        id,
+                        libc::CAN_EFF_FLAG | libc::CAN_RTR_FLAG | libc::CAN_SFF_MASK,
+                    )
+                })
+                .collect();
             let bus = if let Some(fd) = fds[side] {
                 let socket = CanSocket::from(unsafe { OwnedFd::from_raw_fd(fd) });
                 let raw = socket.as_raw_socket();
@@ -404,16 +417,17 @@ pub fn run(
     let mut stats = Statistics::default();
     let mut pollers = [
         timer.0.as_raw_fd(),
-        sockets[0].as_raw_fd(),
-        sockets[1].as_raw_fd(),
         parent.as_ref().map_or(-1, AsRawFd::as_raw_fd),
         calls.wake.as_raw_fd(),
     ]
+    .into_iter()
+    .chain(sockets.iter().map(AsRawFd::as_raw_fd))
     .map(|fd| libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
-    });
+    })
+    .collect::<Vec<_>>();
     while !stopped.load(Ordering::Relaxed) {
         let timeout = if advancing.is_some() { 0 } else { -1 };
         let ready = unsafe { libc::poll(pollers.as_mut_ptr(), pollers.len() as _, timeout) };
@@ -423,9 +437,9 @@ pub fn run(
             }
             bail!("poll: {}", io::Error::last_os_error());
         }
-        if pollers[3].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if pollers[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let mut byte = 0u8;
-            let count = unsafe { libc::read(pollers[3].fd, (&mut byte as *mut u8).cast(), 1) };
+            let count = unsafe { libc::read(pollers[1].fd, (&mut byte as *mut u8).cast(), 1) };
             if count == 0 {
                 break;
             }
@@ -435,7 +449,7 @@ pub fn run(
                 io::Error::last_os_error()
             );
         }
-        if pollers[4].revents & libc::POLLIN != 0 {
+        if pollers[2].revents & libc::POLLIN != 0 {
             let mut bytes = [0; 256];
             loop {
                 match calls.wake.read(&mut bytes) {
@@ -472,7 +486,7 @@ pub fn run(
             let _ = reply.send(Ok(Reply::Done));
         }
         for (side, bus) in sockets.iter().enumerate() {
-            if pollers[side + 1].revents & libc::POLLIN != 0 {
+            if pollers[side + 3].revents & libc::POLLIN != 0 {
                 receive(bus, side, physics, &mut stats)?;
             }
         }

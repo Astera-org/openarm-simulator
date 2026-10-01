@@ -125,7 +125,7 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
             }
         }
         "/fault" => {
-            ensure!(payload[2].is_object(), "fault settings must be an object");
+            ensure!(payload[1].is_object(), "fault settings must be an object");
             AdminRequest::Fault {
                 payload: serde_json::from_value(payload)?,
             }

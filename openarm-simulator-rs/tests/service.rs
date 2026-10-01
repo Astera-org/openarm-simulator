@@ -203,7 +203,7 @@ fn rejected(mut command: Command, fds: &[RawFd], reason: &str) {
 fn cli_and_invalid_descriptors() {
     let help = command().arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("--left-interface"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--can-interface"));
     {
         let wrong = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
         let fd = wrong.as_raw_fd();
@@ -240,7 +240,7 @@ fn host_listener_private_namespace() {
         let mut cmd = Command::new("unshare");
         cmd.args(["--user", "--map-root-user", "--net", "sh", "-ec",
             "ip link set lo up; ip link add rightbus type vcan; ip link set rightbus mtu 72 up; ip link add leftbus type vcan; ip link set leftbus mtu 72 up; exec \"$@\"", "namespace", BINARY,
-            "--model", model, "--left-interface", "leftbus", "--right-interface", "rightbus", "--parent-fd", &lifetime.as_raw_fd().to_string()]);
+            "--model", model, "--can-interface", "left=leftbus", "--can-interface", "right=rightbus", "--parent-fd", &lifetime.as_raw_fd().to_string()]);
         cmd.env_remove("LISTEN_FDS")
             .env_remove("LISTEN_PID")
             .env_remove("OPENARM_SIMULATOR_CONFIG");
@@ -259,7 +259,10 @@ fn host_listener_private_namespace() {
             fs::read_link(format!("/proc/{}/ns/net", service.0.id())).unwrap(),
             fs::read_link("/proc/self/ns/net").unwrap()
         );
-        assert_eq!(service.get("/state")["state"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            service.get("/state")["state"].as_object().unwrap().len(),
+            16
+        );
         drop(parent);
         service.wait();
     }
@@ -388,7 +391,12 @@ fn can_http_and_lifecycle() {
         cmd.args(["--model", model, "--port", "0", "--report-dir"])
             .arg(directory.path());
         if mode != 0 {
-            cmd.args(["--left-interface", names[1], "--right-interface", names[0]]);
+            cmd.args([
+                "--can-interface",
+                &format!("left={}", names[1]),
+                "--can-interface",
+                &format!("right={}", names[0]),
+            ]);
         }
         let http = TcpListener::bind("127.0.0.1:0").unwrap();
         let buses: Vec<_> = names
@@ -400,12 +408,12 @@ fn can_http_and_lifecycle() {
             cmd.args([
                 "--http-fd",
                 &fds[0].to_string(),
-                "--left-can-fd",
-                &fds[1].to_string(),
+                "--can-fd",
+                &format!("left={}", fds[1]),
             ]);
             if mode == 1 {
                 fds.push(buses[0].as_raw_fd());
-                cmd.args(["--right-can-fd", &buses[0].as_raw_fd().to_string()]);
+                cmd.args(["--can-fd", &format!("right={}", buses[0].as_raw_fd())]);
             }
             inherit(&mut cmd, &fds);
         }
@@ -417,17 +425,21 @@ fn can_http_and_lifecycle() {
             let bus = CanFdSocket::open(name).unwrap();
             bus.set_read_timeout(Duration::from_secs(2)).unwrap();
             can_command(&bus, [255, 255, 255, 255, 255, 255, 255, 0xfc], 1, 1);
-            service.post("/fault", json!([side,1,{"status":9}]), 200);
+            service.post(
+                "/fault",
+                json!([format!("{side}_joint1"), {"status":9}]),
+                200,
+            );
             can_command(&bus, [1, 0, 0xcc, 0, 0, 0, 0, 0], 0x7ff, 9);
             can_command(&bus, [255, 255, 255, 255, 255, 255, 255, 0xfb], 1, 0);
             can_command(&bus, [255, 255, 255, 255, 255, 255, 255, 0xfc], 1, 1);
             can_command(&bus, [255, 255, 255, 255, 255, 255, 255, 0xfd], 1, 0);
         }
         for value in [
-            json!(["right",1,{"status":1}]),
+            json!(["right_joint1", {"status":1}]),
             json!(["wrong", 1, {}]),
-            json!(["right", 0, {}]),
-            json!(["right",1,{"status":16}]),
+            json!(["right_joint0", {}]),
+            json!(["right_joint1", {"status":16}]),
             json!({}),
             Value::Null,
         ] {
@@ -435,7 +447,7 @@ fn can_http_and_lifecycle() {
         }
         service.post("/push", json!({"right": ([1; 8])}), 400);
         service.post("/push", json!([]), 400);
-        service.post("/fault", json!(["left", 1, []]), 400);
+        service.post("/fault", json!(["left_joint1", []]), 400);
         service.post("/reset", json!({"right": ([0; 7])}), 400);
         for headers in [
             "Content-Type: application/json\r\nContent-Length: 3\r\n",
@@ -488,7 +500,6 @@ fn can_http_and_lifecycle() {
                 .as_object()
                 .unwrap()
                 .values()
-                .flat_map(|a| a.as_array().unwrap())
                 .all(|m| m["status"] == 0)
         );
         assert_eq!(service.get("/configuration"), configuration);
@@ -592,17 +603,17 @@ fn reject_bad_can(model: &str) {
             model,
             "--port",
             "0",
-            "--right-can-fd",
-            &right.to_string(),
-            "--left-can-fd",
-            &left.to_string(),
+            "--can-fd",
+            &format!("right={}", right),
+            "--can-fd",
+            &format!("left={}", left),
         ]);
         rejected(cmd, &[right, left], reason);
     }
     let mut foreign = Command::new("unshare");
     foreign.args(["--user", "--map-root-user", "--net", "sh", "-ec",
         "for bus in can0 can1; do ip link add \"$bus\" type vcan; ip link set \"$bus\" mtu 72 up; done; exec \"$@\"", "namespace", BINARY,
-        "--model", model, "--port", "0", "--host", "0.0.0.0", "--right-can-fd", &buses[0].as_raw_fd().to_string(), "--left-can-fd", &buses[1].as_raw_fd().to_string()]);
+        "--model", model, "--port", "0", "--host", "0.0.0.0", "--can-fd", &format!("right={}", buses[0].as_raw_fd()), "--can-fd", &format!("left={}", buses[1].as_raw_fd())]);
     rejected(
         foreign,
         &[buses[0].as_raw_fd(), buses[1].as_raw_fd()],
@@ -620,10 +631,10 @@ fn reject_bad_can(model: &str) {
             model,
             "--port",
             "0",
-            "--right-interface",
-            names[0],
-            "--left-interface",
-            names[1],
+            "--can-interface",
+            &format!("right={}", names[0]),
+            "--can-interface",
+            &format!("left={}", names[1]),
         ]);
         rejected(
             cmd,
@@ -669,7 +680,7 @@ fn clock_start_reset_and_fixed_updates() {
     assert_eq!(initial["advancing"], false);
     assert_eq!(initial["time_ns"], 0);
     assert_eq!(initial["timestep_ns"], period);
-    assert_eq!(initial["state"]["left"][6]["q"], 0.25);
+    assert_eq!(initial["state"]["left_joint7"]["q"], 0.25);
     thread::sleep(Duration::from_millis(20));
     assert_eq!(service.get("/state"), initial);
     service.clock("/pause", 204);
@@ -705,7 +716,7 @@ fn clock_start_reset_and_fixed_updates() {
     can_command(&bus, [255, 255, 255, 255, 255, 255, 255, 0xfc], 7, 1);
     service.post(
         "/fault",
-        json!(["left", 7, {"status": 9, "silent": true}]),
+        json!(["left_joint7", {"status": 9, "silent": true}]),
         200,
     );
     service.post("/push", json!({"left": ([0.1; 7])}), 200);
@@ -1019,4 +1030,65 @@ fn can_client_codec_and_socket_errors() {
         bus.write_frame(&enable_frame).unwrap_err().raw_os_error(),
         Some(libc::ENETDOWN)
     );
+}
+
+#[test]
+fn configured_motor_addresses_bindings_and_reset() {
+    if !in_can_namespace("configured_motor_addresses_bindings_and_reset") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("motors.json");
+    let binding = json!({"bus":"bench", "actuator":"right_joint7_ctrl", "controller":{
+        "id":291, "reply_id":1110, "ranges":{"pmax":12.5,"vmax":30.,"tmax":10.}
+    }});
+    let settings = json!({"buses":{"bench":"can0"}, "motors":{"tool":binding}});
+    fs::write(&config, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let mut cmd = command();
+    cmd.args([
+        "--model",
+        openarm_test_model::SCENE,
+        "--config",
+        config.to_str().unwrap(),
+        "--port",
+        "0",
+    ]);
+    let mut service = Running::start(&mut cmd);
+    let initial = service.get("/state");
+    assert_eq!(initial["state"].as_object().unwrap().len(), 1);
+    assert_eq!(initial["state"]["tool"]["id"], 291);
+    assert_eq!(initial["state"]["tool"]["reply_id"], 1110);
+    let bus = client_bus("can0", 1110);
+    bus.write_frame(&frame(291, [255, 255, 255, 255, 255, 255, 255, 0xfc]))
+        .unwrap();
+    let reply = bus.read_frame().unwrap();
+    assert_eq!(reply.raw_id(), 1110);
+    assert_eq!(reply.data()[0], 0x13);
+    bus.write_frame(&frame(0x7ff, [0x23, 1, 0x55, 21, 0, 0, 0, 0x41]))
+        .unwrap();
+    assert_eq!(&bus.read_frame().unwrap().data()[4..], &8f32.to_le_bytes());
+    assert_eq!(service.get("/state")["state"]["tool"]["ranges"]["pmax"], 8.);
+    service.clock("/reset", 200);
+    assert_eq!(service.get("/state"), initial);
+    service.terminate();
+
+    for replacement in [
+        json!({"a":binding, "b":binding}),
+        json!({"a": {"bus":"missing", "actuator":"right_joint7_ctrl", "controller":binding["controller"]}}),
+        json!({"a": {"bus":"bench", "actuator":"missing", "controller":binding["controller"]}}),
+    ] {
+        let mut invalid = settings.clone();
+        invalid["motors"] = replacement;
+        fs::write(&config, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let mut cmd = command();
+        cmd.args([
+            "--model",
+            openarm_test_model::SCENE,
+            "--config",
+            config.to_str().unwrap(),
+            "--port",
+            "0",
+        ]);
+        assert!(!cmd.output().unwrap().status.success());
+    }
 }

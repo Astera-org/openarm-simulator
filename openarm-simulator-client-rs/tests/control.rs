@@ -2,7 +2,7 @@
 //! same private user/network namespaces, vcan and iproute2 as simulator tests.
 use openarm_simulator_client_rs::{
     Client, Error, StatusCode,
-    models::{Arm, Fault, MappingRanges, MotorStatus, Push},
+    models::{Fault, MappingRanges, MotorStatus, Push},
 };
 use std::{
     io::{BufRead, BufReader},
@@ -107,17 +107,17 @@ fn control_api_against_simulator() {
             let initial = client.state().await.unwrap();
             assert!(initial.paused);
             assert_eq!(initial.time_ns, 0);
-            assert_eq!(initial.state.left[0].status, MotorStatus::DISABLED);
+            assert_eq!(initial.state["left_joint1"].status, MotorStatus::DISABLED);
             assert_eq!(
-                initial.state.left[0].ranges,
+                initial.state["left_joint1"].ranges,
                 MappingRanges {
                     pmax: 12.5,
                     vmax: 45.,
                     tmax: 54.
                 }
             );
-            assert_eq!(initial.state.left[0].mos_temperature, 25);
-            assert_eq!(initial.state.left[0].rotor_temperature, 25);
+            assert_eq!(initial.state["left_joint1"].mos_temperature, 25);
+            assert_eq!(initial.state["left_joint1"].rotor_temperature, 25);
             let configuration = client.configuration().await.unwrap();
             assert_eq!(initial.timestep_ns, configuration.configuration.timestep_ns);
             assert_eq!(client.pause().await.unwrap(), StatusCode::NO_CONTENT);
@@ -133,8 +133,7 @@ fn control_api_against_simulator() {
             assert_eq!(client.state().await.unwrap().statistics.steps, 1);
             let fault = client
                 .fault(
-                    Arm::Left,
-                    1,
+                    "left_joint1",
                     Fault {
                         status: Some(MotorStatus::UNDERVOLTAGE),
                         silent: Some(true),
@@ -142,13 +141,12 @@ fn control_api_against_simulator() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(fault.state.left[0].status, MotorStatus::UNDERVOLTAGE);
-            assert!(fault.state.left[0].silent);
-            assert_eq!(fault.state.right[0].status, MotorStatus::DISABLED);
+            assert_eq!(fault.state["left_joint1"].status, MotorStatus::UNDERVOLTAGE);
+            assert!(fault.state["left_joint1"].silent);
+            assert_eq!(fault.state["right_joint1"].status, MotorStatus::DISABLED);
             let unknown = client
                 .fault(
-                    Arm::Left,
-                    1,
+                    "left_joint1",
                     Fault {
                         status: Some(MotorStatus(2)),
                         silent: None,
@@ -156,7 +154,7 @@ fn control_api_against_simulator() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(unknown.state.left[0].status, MotorStatus(2));
+            assert_eq!(unknown.state["left_joint1"].status, MotorStatus(2));
             let pushed = client
                 .push(Push {
                     left: Some([0.1; 7]),
@@ -180,7 +178,7 @@ fn control_api_against_simulator() {
             assert_eq!(client.pause().await.unwrap(), StatusCode::OK);
             assert_eq!(client.pause().await.unwrap(), StatusCode::NO_CONTENT);
             assert!(matches!(
-                client.fault(Arm::Right, 0, Fault::default()).await,
+                client.fault("right_joint0", Fault::default()).await,
                 Err(Error::Api {
                     status: StatusCode::BAD_REQUEST,
                     ..

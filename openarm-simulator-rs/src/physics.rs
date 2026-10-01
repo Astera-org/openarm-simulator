@@ -23,6 +23,10 @@ pub const RADIUS: f64 = 0.044 / 1.0472;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "crate::motor::v1_buses")]
+    pub buses: BTreeMap<String, String>,
+    #[serde(default = "crate::motor::v1_bindings")]
+    pub motors: BTreeMap<String, crate::motor::MotorBinding>,
     /// Fixed integration interval; the scheduler and API use integer nanoseconds.
     #[serde(default = "default_timestep")]
     pub timestep_ns: u64,
@@ -41,6 +45,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            buses: crate::motor::v1_buses(),
+            motors: crate::motor::v1_bindings(),
             timestep_ns: DEFAULT_TIMESTEP_NS,
             poses: Arms::default(),
             offsets: Arms::default(),
@@ -303,6 +309,20 @@ impl Physics {
         Ok(world)
     }
 
+    pub fn port(&self, actuator: &str) -> Result<(usize, usize)> {
+        let id = self.model.id(Object::Actuator, actuator)?;
+        self.index
+            .iter()
+            .enumerate()
+            .find_map(|(side, ix)| {
+                ix.actuator
+                    .iter()
+                    .position(|a| *a == id)
+                    .map(|joint| (side, joint))
+            })
+            .context("actuator is not supported by the OpenArm scene adapter")
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         let poses = self.initial_poses;
         ensure!(
@@ -506,75 +526,73 @@ mod tests {
             ..Config::default()
         });
         p.step(200).unwrap();
-        assert!((p.motors[0][3].q - pose[3]).abs() > 0.001);
+        assert!((p.motors[11].q - pose[3]).abs() > 0.001);
         p.reset().unwrap();
-        for arm in &mut p.motors {
-            for m in arm {
-                m.status = MotorStatus::ENABLED;
-                m.command = MitCommand {
-                    kp: 150.,
-                    kd: 2.,
-                    q: m.q,
-                    ..MitCommand::default()
-                };
-            }
+        for m in &mut p.motors {
+            m.status = MotorStatus::ENABLED;
+            m.command = MitCommand {
+                kp: 150.,
+                kd: 2.,
+                q: m.q,
+                ..MitCommand::default()
+            };
         }
         p.step(1000).unwrap();
-        assert!((p.motors[0][3].q - pose[3]).abs() < 0.08);
-        assert!(p.motors[0][3].torque.abs() > 0.1);
+        assert!((p.motors[11].q - pose[3]).abs() < 0.08);
+        assert!(p.motors[11].torque.abs() > 0.1);
     }
 
     #[test]
     fn gripper_transmission_loaded_stop_and_no_teleport() {
         let mut p = world(Config::default());
-        p.motors[0][7].status = MotorStatus::ENABLED;
-        p.motors[0][7].command = MitCommand {
+        p.motors[15].status = MotorStatus::ENABLED;
+        p.motors[15].command = MitCommand {
             kp: 10.,
             kd: 0.9,
             q: -0.5,
             ..MitCommand::default()
         };
         p.step(1).unwrap();
-        assert!((p.motors[0][7].q + 0.5).abs() > 0.1);
+        assert!((p.motors[15].q + 0.5).abs() > 0.1);
         p.step(1000).unwrap();
-        assert!((p.motors[0][7].q + 0.5).abs() < 0.01);
+        assert!((p.motors[15].q + 0.5).abs() < 0.01);
         {
             for i in &p.physics.index[0].qpos[7..] {
                 assert!((p.physics.data.view().qpos[*i] - 0.5 * RADIUS).abs() < 0.001);
             }
         }
-        p.motors[0][7].command = MitCommand {
+        p.motors[15].command = MitCommand {
             kp: 45.,
             kd: 1.2,
             q: 0.1,
             ..MitCommand::default()
         };
         p.step(2000).unwrap();
-        let m = p.motors[0][7];
+        let m = p.motors[15];
         assert!(m.dq.abs() < 0.01 && m.torque > 0.3 && m.q > 0. && m.q < 0.2f64.to_radians());
     }
 
     #[test]
     fn joint_target_is_physics_driven_and_force_is_bounded() {
         let mut p = world(Config::default());
-        p.motors[0][6].status = MotorStatus::ENABLED;
-        p.motors[0][6].command = MitCommand {
+        p.motors[14].status = MotorStatus::ENABLED;
+        p.motors[14].command = MitCommand {
             kp: 10.,
             kd: 0.5,
             q: 0.3,
             ..MitCommand::default()
         };
         p.step(1).unwrap();
-        assert!(p.motors[0][6].q < 0.1);
+        assert!(p.motors[14].q < 0.1);
         p.step(1000).unwrap();
-        assert!((p.motors[0][6].q - 0.3).abs() < 0.05);
-        assert!(p.motors[1][6].q.abs() < 0.05);
-        p.motors[0][6].command.q = 10.;
+        assert!((p.motors[14].q - 0.3).abs() < 0.05);
+        assert!(p.motors[6].q.abs() < 0.05);
+        p.motors[14].command.q = 10.;
         p.step(1).unwrap();
-        assert!((p.motors[0][6].torque - 7.).abs() < 1e-6);
-        p.motors[0][6].status = MotorStatus::DISABLED;
+        assert!((p.motors[14].torque - 7.).abs() < 1e-6);
+        p.motors[14].status = MotorStatus::DISABLED;
         p.step(1).unwrap();
-        assert_eq!(p.motors[0][6].torque, 0.);
+        assert_eq!(p.motors[14].torque, 0.);
     }
 
     #[test]
@@ -586,22 +604,22 @@ mod tests {
             },
             ..Config::default()
         });
-        assert_eq!(p.motors[0][6].q, 0.01);
-        p.motors[0][6].status = MotorStatus::ENABLED;
-        p.motors[0][6].command = MitCommand {
+        assert_eq!(p.motors[14].q, 0.01);
+        p.motors[14].status = MotorStatus::ENABLED;
+        p.motors[14].command = MitCommand {
             kp: 30.,
             kd: 0.8,
             q: 0.3,
             ..MitCommand::default()
         };
         p.step(1000).unwrap();
-        assert!((p.motors[0][6].q - 0.3).abs() < 0.02);
-        p.motors[0][6].silent = true;
+        assert!((p.motors[14].q - 0.3).abs() < 0.02);
+        p.motors[14].silent = true;
         p.reset().unwrap();
         assert!(
-            !p.motors[0][6].silent
-                && p.motors[0][6].status == MotorStatus::DISABLED
-                && p.motors[0][6].command.kp == 0.
+            !p.motors[14].silent
+                && p.motors[14].status == MotorStatus::DISABLED
+                && p.motors[14].command.kp == 0.
         );
     }
 
@@ -708,12 +726,12 @@ mod tests {
             let initial_energy = p.physics.model.kinetic_energy(&mut p.physics.data);
             let mut friction_work = 0.;
             for _ in 0..1000 {
-                let before = p.motors[0][6].q;
+                let before = p.motors[14].q;
                 p.step(1).unwrap();
                 {
                     let d = p.physics.data.view();
                     let force = d.qfrc_constraint[dof];
-                    friction_work += force * (p.motors[0][6].q - before);
+                    friction_work += force * (p.motors[14].q - before);
                     assert!(force.abs() <= p.physics.model.view().dof_frictionloss[dof] + 1e-10);
 
                     assert!(
@@ -745,19 +763,19 @@ mod tests {
             repeated.step(1).unwrap();
         }
         assert!(
-            basic.motors[0][6].q > 5. * rich.motors[0][6].q,
+            basic.motors[14].q > 5. * rich.motors[14].q,
             "basic={} enhanced={}",
-            basic.motors[0][6].q,
-            rich.motors[0][6].q
+            basic.motors[14].q,
+            rich.motors[14].q
         );
-        assert_eq!(rich.motors[0][6].q, repeated.motors[0][6].q);
-        assert_eq!(rich.motors[0][6].dq, repeated.motors[0][6].dq);
-        assert_eq!(rich.motors[0][6].torque, 0.); // External push is not motor torque.
+        assert_eq!(rich.motors[14].q, repeated.motors[14].q);
+        assert_eq!(rich.motors[14].dq, repeated.motors[14].dq);
+        assert_eq!(rich.motors[14].torque, 0.); // External push is not motor torque.
         force[0][6] = 0.9;
         rich.push(force).unwrap();
-        let before = rich.motors[0][6].q;
+        let before = rich.motors[14].q;
         rich.step(200).unwrap();
-        assert!(rich.motors[0][6].q - before > 0.01);
+        assert!(rich.motors[14].q - before > 0.01);
     }
 
     #[test]
@@ -782,8 +800,8 @@ mod tests {
                 p.push(force).unwrap();
                 p.step((0.1 / step).round() as u64).unwrap();
             }
-            endpoints.push(p.motors[0][6].q);
-            assert!(p.motors[0][6].dq.is_finite());
+            endpoints.push(p.motors[14].q);
+            assert!(p.motors[14].dq.is_finite());
         }
         for q in &endpoints[1..] {
             // Severe square torque pulses and stick/slip are first-order here;

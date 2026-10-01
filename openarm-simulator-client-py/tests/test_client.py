@@ -72,23 +72,23 @@ class ClientTest(unittest.TestCase):
                 configuration = client.configuration()
                 self.assertEqual(from_json(State, to_json(state)), state)
                 self.assertEqual(from_json(Configuration, to_json(configuration)), configuration)
-                self.assertEqual(len(state.state.left), 8)
-                self.assertIsInstance(state.state.left[0].command, MotorCommand)
-                self.assertEqual(state.state.left[0].ranges, MappingRanges(12.5, 45.0, 54.0))
-                self.assertEqual(state.state.left[0].mos_temperature, 25)
-                self.assertEqual(state.state.left[0].rotor_temperature, 25)
+                self.assertEqual(len(state.state), 16)
+                self.assertIsInstance(state.state["left_joint1"].command, MotorCommand)
+                self.assertEqual(state.state["left_joint1"].ranges, MappingRanges(12.5, 45.0, 54.0))
+                self.assertEqual(state.state["left_joint1"].mos_temperature, 25)
+                self.assertEqual(state.state["left_joint1"].rotor_temperature, 25)
                 self.assertIsInstance(configuration.configuration.encoder_offsets_rad.left, tuple)
                 self.assertEqual(state.timestep_ns, configuration.configuration.timestep_ns)
 
-                fault = client.fault("left", 1, Fault(status=9, silent=True))
-                self.assertEqual(fault.state.left[0].status, 9)
-                self.assertTrue(fault.state.left[0].silent)
-                self.assertEqual(fault.state.right[0].status, 0)
-                unknown = client.fault("left", 1, Fault(status=2))
-                self.assertEqual(unknown.state.left[0].status, 2)
-                cleared = client.fault("left", 1, Fault(status=0, silent=False))
-                self.assertEqual(cleared.state.left[0].status, 0)
-                self.assertFalse(cleared.state.left[0].silent)
+                fault = client.fault("left_joint1", Fault(status=9, silent=True))
+                self.assertEqual(fault.state["left_joint1"].status, 9)
+                self.assertTrue(fault.state["left_joint1"].silent)
+                self.assertEqual(fault.state["right_joint1"].status, 0)
+                unknown = client.fault("left_joint1", Fault(status=2))
+                self.assertEqual(unknown.state["left_joint1"].status, 2)
+                cleared = client.fault("left_joint1", Fault(status=0, silent=False))
+                self.assertEqual(cleared.state["left_joint1"].status, 0)
+                self.assertFalse(cleared.state["left_joint1"].silent)
 
                 push = client.push(Push(left=(0.1,) * 7))
                 self.assertEqual(push.plant.applied_torque_nm.left, (0.1,) * 7)
@@ -116,8 +116,8 @@ class ClientTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         client.advance(duration)
 
-                with self.assertRaisesRegex(APIError, "joint") as error:
-                    client.fault("left", 0, Fault(status=9))
+                with self.assertRaisesRegex(APIError, "motor") as error:
+                    client.fault("left_joint0", Fault(status=9))
                 self.assertEqual(error.exception.status, 400)
                 with self.assertRaises(ValueError):
                     client.push(Push(left=(float("nan"),) * 7))

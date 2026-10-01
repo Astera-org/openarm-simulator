@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     os::fd::RawFd,
@@ -34,16 +35,12 @@ struct Args {
     /// Inherited listening TCP socket; overrides host/port
     #[arg(long)]
     http_fd: Option<RawFd>,
-    #[arg(long, default_value = "can1")]
-    left_interface: String,
-    #[arg(long, default_value = "can0")]
-    right_interface: String,
-    /// Inherited CAN_RAW socket bound to the left interface in this namespace
-    #[arg(long)]
-    left_can_fd: Option<RawFd>,
-    /// Inherited CAN_RAW socket bound to the right interface in this namespace
-    #[arg(long)]
-    right_can_fd: Option<RawFd>,
+    /// Override a configured bus interface: --can-interface BUS=INTERFACE (repeatable)
+    #[arg(long, value_parser = assignment)]
+    can_interface: Vec<(String, String)>,
+    /// Inherited CAN_RAW socket for a configured bus: --can-fd BUS=FD (repeatable)
+    #[arg(long, value_parser = fd_assignment)]
+    can_fd: Vec<(String, RawFd)>,
     /// Readable pipe/socket; EOF stops the simulator
     #[arg(long)]
     parent_fd: Option<RawFd>,
@@ -53,6 +50,18 @@ struct Args {
     /// Write simulator.json on shutdown
     #[arg(long)]
     report_dir: Option<PathBuf>,
+}
+
+fn assignment(value: &str) -> std::result::Result<(String, String), String> {
+    let (name, value) = value.split_once('=').ok_or("expected BUS=VALUE")?;
+    if name.is_empty() || value.is_empty() {
+        return Err("expected nonempty BUS=VALUE".into());
+    }
+    Ok((name.into(), value.into()))
+}
+fn fd_assignment(value: &str) -> std::result::Result<(String, RawFd), String> {
+    let (name, value) = assignment(value)?;
+    Ok((name, value.parse().map_err(|_| "expected BUS=FD")?))
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -79,17 +88,42 @@ fn configuration(path: Option<&Path>) -> Result<physics::Config> {
 fn main() -> Result<()> {
     let args = Args::parse();
     let http_fd = sockets::activation_fd(args.http_fd)?;
-    sockets::validate(&[http_fd, args.left_can_fd, args.right_can_fd, args.parent_fd])?;
+    let mut descriptors = vec![http_fd, args.parent_fd];
+    descriptors.extend(args.can_fd.iter().map(|(_, fd)| Some(*fd)));
+    sockets::validate(&descriptors)?;
     let parent = args.parent_fd.map(sockets::parent).transpose()?;
     let listener = sockets::http(&args.host, args.port, http_fd)?;
     let address = listener.local_addr()?;
-    let config = configuration(args.config.as_deref())?;
+    let mut config = configuration(args.config.as_deref())?;
+    let mut overrides = std::collections::BTreeSet::new();
+    for (bus, interface) in args.can_interface {
+        ensure!(
+            overrides.insert(bus.clone()),
+            "duplicate bus override {bus}"
+        );
+        *config
+            .buses
+            .get_mut(&bus)
+            .with_context(|| format!("unknown bus {bus}"))? = interface;
+    }
+    let mut can_fds = BTreeMap::new();
+    for (bus, fd) in args.can_fd {
+        ensure!(config.buses.contains_key(&bus), "unknown bus {bus}");
+        ensure!(
+            can_fds.insert(bus.clone(), fd).is_none(),
+            "duplicate bus descriptor {bus}"
+        );
+    }
+    let interfaces: Vec<_> = config.buses.values().cloned().collect();
+    let fds: Vec<_> = config
+        .buses
+        .keys()
+        .map(|bus| can_fds.get(bus).copied())
+        .collect();
     let model = args.model.canonicalize().context("external model path")?;
     ensure!(model.is_file(), "model must be an MJCF file");
-    // Internal motor indexes retain their original right/left mapping.
-    let interfaces = [args.right_interface, args.left_interface];
-    let buses = service::can_sockets(&interfaces, [args.right_can_fd, args.left_can_fd])?;
     let mut physics = simulation::Simulation::load(&model, config)?;
+    let buses = service::can_sockets(&interfaces, &fds, &physics)?;
     let (control, calls) = service::Control::channel()?;
     let stopped = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {

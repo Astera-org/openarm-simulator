@@ -44,7 +44,7 @@ pub struct Fault {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silent: Option<bool>,
 }
-pub type FaultRequest = (Arm, usize, Fault);
+pub type FaultRequest = (String, Fault);
 
 /// Elapsed simulated nanoseconds. Requires a paused clock; fractional update
 /// intervals carry into later advances. Completion is not a CAN consumer barrier.
@@ -56,7 +56,8 @@ pub struct Advance {
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub struct MotorState {
-    pub joint: usize,
+    pub id: u16,
+    pub reply_id: u16,
     pub command: MotorCommand,
     pub q: f64,
     pub dq: f64,
@@ -67,7 +68,7 @@ pub struct MotorState {
     pub silent: bool,
     pub ranges: MappingRanges,
 }
-pub type ArmStates = Arms<[MotorState; 8]>;
+pub type MotorStates = BTreeMap<String, MotorState>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Statistics {
@@ -123,7 +124,7 @@ pub struct Plant {
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct State {
-    pub state: ArmStates,
+    pub state: MotorStates,
     pub statistics: Statistics,
     pub time_ns: u64,
     pub paused: bool,

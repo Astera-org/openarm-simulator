@@ -107,8 +107,14 @@ impl Motor {
             damping: c.kd,
         }
     }
-    pub fn new(config: MotorConfig) -> Result<Self> {
+    /// Create a disabled controller. Mapping settings use float32 register precision.
+    pub fn new(mut config: MotorConfig) -> Result<Self> {
         config.validate()?;
+        config.ranges = MappingRanges {
+            pmax: f64::from(config.ranges.pmax as f32),
+            vmax: f64::from(config.ranges.vmax as f32),
+            tmax: f64::from(config.ranges.tmax as f32),
+        };
         Ok(Self {
             config,
             command: MitCommand::default(),

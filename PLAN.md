@@ -22,7 +22,7 @@ FOR CHOSEN OPTION.
   Preserve implicit proportional/derivative integration, encoder conventions,
   clock ownership, and startup/reset equivalence. Controllers receive logical
   time when their implemented behavior needs it; do not add unused timing APIs.
-- [ ] 4. Accept named motor configurations through startup configuration. Embed
+- [x] 4. Accept named motor configurations through startup configuration. Embed
   the Damiao configuration directly alongside bus and scene bindings. Validate
   controller settings, address conflicts, and bindings at their respective
   boundaries. Reset restores initial controller settings. Motor names, CAN

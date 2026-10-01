@@ -59,7 +59,8 @@ class MappingRanges:
 
 @serde
 class MotorState:
-    joint: int
+    id: int
+    reply_id: int
     command: MotorCommand
     q: float
     dq: float
@@ -69,12 +70,6 @@ class MotorState:
     rotor_temperature: int
     silent: bool
     ranges: MappingRanges
-
-
-@serde
-class ArmStates:
-    left: list[MotorState]
-    right: list[MotorState]
 
 
 @serde
@@ -139,7 +134,7 @@ class Plant:
 
 @serde
 class State:
-    state: ArmStates
+    state: dict[str, MotorState]
     statistics: Statistics
     time_ns: int
     paused: bool

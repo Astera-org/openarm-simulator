@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use std::{error::Error as StdError, time::Duration};
 
 pub use hyper::StatusCode;
-use models::{Advance, Arm, Configuration, ErrorResponse, Fault, Push, State};
+use models::{Advance, Configuration, ErrorResponse, Fault, Push, State};
 pub use openarm_simulator_core_rs as models;
 
 #[derive(Debug, thiserror::Error)]
@@ -155,11 +155,11 @@ impl Client {
         self.clock("/advance", serde_json::to_vec(&Advance { duration_ns })?)
             .await
     }
-    pub async fn fault(&self, arm: Arm, joint: usize, settings: Fault) -> Result<State> {
+    pub async fn fault(&self, motor: &str, settings: Fault) -> Result<State> {
         self.read(
             Method::POST,
             "/fault",
-            serde_json::to_vec(&(arm, joint, settings))?,
+            serde_json::to_vec(&(motor, settings))?,
         )
         .await
     }

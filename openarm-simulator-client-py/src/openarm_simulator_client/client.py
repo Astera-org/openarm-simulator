@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 from serde import SerdeError, to_dict
 from serde.json import from_json
 
-from .models import Advance, Arm, Configuration, ErrorResponse, Fault, Push, State
+from .models import Advance, Configuration, ErrorResponse, Fault, Push, State
 
 T = TypeVar("T")
 
@@ -24,7 +24,7 @@ class APIError(RuntimeError):
 class Client:
     """Control an existing simulator; process lifetime belongs to its launcher.
 
-    Example: Client("http://127.0.0.1:8080").fault("left", 1, Fault(status=9))
+    Example: Client("http://127.0.0.1:8080").fault("left_joint1", Fault(status=9))
     """
 
     def __init__(self, url: str = "http://127.0.0.1:8080", *, timeout: float = 5.0):
@@ -93,8 +93,8 @@ class Client:
             raise ValueError("duration_ns must be an unsigned 64-bit integer")
         return self._request("POST", "/advance", None, Advance(duration_ns))
 
-    def fault(self, arm: Arm, joint: int, settings: Fault) -> State:
-        return self._request("POST", "/fault", State, (arm, joint, settings))
+    def fault(self, motor: str, settings: Fault) -> State:
+        return self._request("POST", "/fault", State, (motor, settings))
 
     def push(self, torques: Push) -> State:
         return self._request("POST", "/push", State, torques)

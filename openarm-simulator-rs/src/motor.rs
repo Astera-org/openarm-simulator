@@ -38,9 +38,53 @@ pub fn v1_motor(joint: usize) -> Motor {
     .unwrap()
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MotorBinding {
+    pub bus: String,
+    pub actuator: String,
+    pub controller: MotorConfig,
+}
+
+pub fn v1_buses() -> std::collections::BTreeMap<String, String> {
+    [
+        ("left".into(), "can1".into()),
+        ("right".into(), "can0".into()),
+    ]
+    .into()
+}
+
+pub fn v1_bindings() -> std::collections::BTreeMap<String, MotorBinding> {
+    ["left", "right"]
+        .into_iter()
+        .flat_map(|side| {
+            (1..=8).map(move |joint| {
+                let motor = v1_motor(joint);
+                (
+                    format!("{side}_joint{joint}"),
+                    MotorBinding {
+                        bus: side.into(),
+                        actuator: if joint == 8 {
+                            format!("{side}_finger1_ctrl")
+                        } else {
+                            format!("{side}_joint{joint}_ctrl")
+                        },
+                        controller: MotorConfig {
+                            id: motor.id(),
+                            reply_id: motor.reply_id(),
+                            ranges: motor.ranges,
+                        },
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 pub fn snapshot(motor: &Motor) -> MotorState {
     MotorState {
-        joint: motor.id() as usize,
+        id: motor.id(),
+        reply_id: motor.reply_id(),
         command: motor.command,
         q: motor.q,
         dq: motor.dq,
@@ -85,7 +129,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "joint": 1,
+                "id": 1, "reply_id": 17,
                 "command": {"kp": 120.5, "kd": 1.5, "q": -1.25, "dq": 2.5, "tau": -3.75},
                 "q": -7.5, "dq": 21.0, "torque": 6.5,
                 "status": 2, "mos_temperature": 31, "rotor_temperature": 47, "silent": true,
@@ -95,7 +139,7 @@ mod tests {
         let restored: MotorState = serde_json::from_value(json).unwrap();
         assert_eq!(restored, snapshot);
         let feedback = Feedback::decode(&motor.state().unwrap(), restored.ranges).unwrap();
-        assert_eq!(feedback.reported_id, restored.joint as u8);
+        assert_eq!(feedback.reported_id, restored.id as u8);
         assert_eq!(
             (feedback.q, feedback.dq, feedback.torque),
             (restored.q, restored.dq, restored.torque)
