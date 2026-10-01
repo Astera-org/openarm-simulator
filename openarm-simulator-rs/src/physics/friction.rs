@@ -1,5 +1,5 @@
 use anyhow::{Result, ensure};
-use openarm_simulator_core_rs::{
+use openarm_simulator_core::{
     Stribeck,
     uom::si::{angle::radian, angular_velocity::radian_per_second, torque::newton_meter},
 };
@@ -64,7 +64,7 @@ pub(super) fn bound_nm(law: &Stribeck, sliding_nm: f64, physical_q: f64, velocit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openarm_simulator_core_rs::{
+    use openarm_simulator_core::{
         AngleModulation,
         uom::si::f64::{Angle, AngularVelocity, Torque},
     };

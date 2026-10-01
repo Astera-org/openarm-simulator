@@ -1,7 +1,7 @@
 use crate::simulation::Simulation;
 use anyhow::{Context, Result, ensure};
-use damiao_can_rs::REGISTER_CAN_ID;
-use openarm_simulator_core_rs::Statistics;
+use damiao_can::REGISTER_CAN_ID;
+use openarm_simulator_core::Statistics;
 use serde_json::Value;
 use socketcan::{
     CanFdFrame, CanFdSocket, CanFilter, CanSocket, EmbeddedFrame, Frame, Socket, SocketOptions,

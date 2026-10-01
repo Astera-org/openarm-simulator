@@ -1,6 +1,6 @@
 //! Client-to-server integration, including the shared wire types. Requires the
 //! same private user/network namespaces, vcan and iproute2 as simulator tests.
-use openarm_simulator_client_rs::{
+use openarm_simulator_client::{
     Client, Error, StatusCode,
     models::{
         AppliedForce, Fault, MappingRanges, MotorStatus, Push, SiteIndex, Spring,
@@ -44,7 +44,7 @@ fn control_api_against_simulator() {
             "--offline",
             "--message-format=json-render-diagnostics",
             "-p",
-            "openarm-simulator-rs",
+            "openarm-simulator",
         ])
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
         .output()
@@ -59,7 +59,7 @@ fn control_api_against_simulator() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find_map(|message| {
-            (message["target"]["name"] == "openarm-simulator-rs")
+            (message["target"]["name"] == "openarm-simulator")
                 .then(|| message["executable"].as_str().map(str::to_owned))
                 .flatten()
         })
@@ -140,7 +140,7 @@ fn control_api_against_simulator() {
             let configuration = client.configuration().await.unwrap();
             assert_eq!(
                 configuration.configuration.integrator,
-                openarm_simulator_client_rs::models::Integrator::ImplicitFast
+                openarm_simulator_client::models::Integrator::ImplicitFast
             );
             let names = client.names().await.unwrap();
             let joint = names.joints["openarm_left_joint7"];
@@ -248,7 +248,7 @@ fn control_api_against_simulator() {
             assert!(matches!(
                 client
                     .push(Push::from([(
-                        openarm_simulator_client_rs::models::JointIndex(usize::MAX),
+                        openarm_simulator_client::models::JointIndex(usize::MAX),
                         Torque::new::<newton_meter>(1.)
                     )]))
                     .await,

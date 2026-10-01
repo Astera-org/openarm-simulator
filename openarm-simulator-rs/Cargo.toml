@@ -1,15 +1,15 @@
 [package]
-name = "openarm-simulator-rs"
+name = "openarm-simulator"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 publish = false
 
 [dependencies]
-damiao-simulator-rs = { path = "../damiao-simulator-rs" }
-openarm-simulator-core-rs = { path = "../openarm-simulator-core-rs" }
-mujoco-rs = { path = "../mujoco-rs" }
-damiao-can-rs = { path = "../damiao-can-rs" }
+damiao-simulator = { path = "../damiao-simulator-rs" }
+openarm-simulator-core = { path = "../openarm-simulator-core-rs" }
+mujoco = { path = "../mujoco-rs" }
+damiao-can = { path = "../damiao-can-rs" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 http-body-util = "0.1"

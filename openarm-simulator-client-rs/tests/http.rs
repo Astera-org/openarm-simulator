@@ -1,4 +1,4 @@
-use openarm_simulator_client_rs::{Client, Error, StatusCode};
+use openarm_simulator_client::{Client, Error, StatusCode};
 use std::{
     io::{BufRead, BufReader, Write},
     net::TcpListener,

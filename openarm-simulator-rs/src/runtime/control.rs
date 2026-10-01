@@ -1,5 +1,5 @@
 use anyhow::Result;
-use openarm_simulator_core_rs::{
+use openarm_simulator_core::{
     Advance, AppliedForce, Configuration, FaultRequest, PushRequest, SceneNames, Spring, State,
 };
 use serde_json::Value;

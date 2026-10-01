@@ -9,4 +9,4 @@ publish = false
 path = "lib.rs"
 
 [build-dependencies]
-download-cache-rs = { path = "../../../download-cache-rs" }
+download-cache = { path = "../../../download-cache-rs" }

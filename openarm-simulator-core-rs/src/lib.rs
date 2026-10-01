@@ -1,9 +1,9 @@
 #![deny(unsafe_code)]
 //! Shared simulator administration models. This crate has no engine or transport
 //! dependencies. Motor control still goes through CAN.
-pub use damiao_can_rs::MotorStatus;
+pub use damiao_can::MotorStatus;
 pub use mint;
-pub use mujoco_core_rs::{
+pub use mujoco_core::{
     ActuatorIndex, BodyIndex, GeomIndex, Integrator, JointIndex, JointKind, SiteIndex,
 };
 use serde::{Deserialize, Serialize};
@@ -40,8 +40,8 @@ pub struct MotorCommand {
     #[serde(rename = "tau_nm")]
     pub tau: Torque,
 }
-impl From<damiao_can_rs::MitCommand> for MotorCommand {
-    fn from(command: damiao_can_rs::MitCommand) -> Self {
+impl From<damiao_can::MitCommand> for MotorCommand {
+    fn from(command: damiao_can::MitCommand) -> Self {
         Self {
             kp: Torque::new::<newton_meter>(command.kp) / Angle::new::<radian>(1.),
             kd: Torque::new::<newton_meter>(command.kd)
@@ -52,7 +52,7 @@ impl From<damiao_can_rs::MitCommand> for MotorCommand {
         }
     }
 }
-impl From<MotorCommand> for damiao_can_rs::MitCommand {
+impl From<MotorCommand> for damiao_can::MitCommand {
     fn from(command: MotorCommand) -> Self {
         Self {
             kp: command.kp.value,
@@ -74,8 +74,8 @@ pub struct MappingRanges {
     #[serde(rename = "tmax_nm")]
     pub tmax: uom::si::f32::Torque,
 }
-impl From<damiao_can_rs::MappingRanges> for MappingRanges {
-    fn from(ranges: damiao_can_rs::MappingRanges) -> Self {
+impl From<damiao_can::MappingRanges> for MappingRanges {
+    fn from(ranges: damiao_can::MappingRanges) -> Self {
         Self {
             pmax: uom::si::f32::Angle::new::<radian>(ranges.pmax),
             vmax: uom::si::f32::AngularVelocity::new::<radian_per_second>(ranges.vmax),
@@ -83,7 +83,7 @@ impl From<damiao_can_rs::MappingRanges> for MappingRanges {
         }
     }
 }
-impl From<MappingRanges> for damiao_can_rs::MappingRanges {
+impl From<MappingRanges> for damiao_can::MappingRanges {
     fn from(ranges: MappingRanges) -> Self {
         Self {
             pmax: ranges.pmax.get::<radian>(),

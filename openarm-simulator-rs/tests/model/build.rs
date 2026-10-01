@@ -1,4 +1,4 @@
-use download_cache_rs::{cache, fetch};
+use download_cache::{cache, fetch};
 use std::{env, path::PathBuf};
 
 fn main() {

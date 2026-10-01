@@ -1,6 +1,6 @@
 //! MuJoCo model editing, owned model/data allocations and bounded array views.
 use anyhow::{Context, Result, ensure};
-use mujoco_sys_rs as ffi;
+use mujoco_sys as ffi;
 use std::{
     ffi::{CStr, CString},
     path::Path,
@@ -17,7 +17,7 @@ pub const NIMP: usize = ffi::mjNIMP as usize;
 pub const NGAIN: usize = ffi::mjNGAIN as usize;
 pub const NBIAS: usize = ffi::mjNBIAS as usize;
 
-pub use mujoco_core_rs::{
+pub use mujoco_core::{
     ActuatorIndex, BodyIndex, GeomIndex, Integrator, JointIndex, JointKind, Object, ObjectIndex,
     SiteIndex,
 };

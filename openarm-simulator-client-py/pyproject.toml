@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "openarm-simulator-client-py"
+name = "openarm-simulator-client"
 version = "0.1.0"
 description = "Typed Python client for the OpenArm simulator control API"
 requires-python = ">=3.12"

@@ -9,7 +9,7 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
-use openarm_simulator_core_rs::ErrorResponse;
+use openarm_simulator_core::ErrorResponse;
 use serde_json::{Value, json};
 use std::{convert::Infallible, net::TcpListener, thread, time::Duration};
 use tokio::time::timeout;

@@ -2,8 +2,8 @@
 use super::{Calls, Clock, Conflict, NotFound, Reply, Request, can};
 use crate::{physics::Physics, simulation::Simulation};
 use anyhow::{Context, Result, bail, ensure};
-use damiao_can_rs::MotorStatus;
-use openarm_simulator_core_rs::{Configuration, State, Statistics};
+use damiao_can::MotorStatus;
+use openarm_simulator_core::{Configuration, State, Statistics};
 use serde_json::Value;
 use socketcan::CanFdSocket;
 use std::{

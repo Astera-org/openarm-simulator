@@ -25,7 +25,7 @@ class ClientTest(unittest.TestCase):
         build = subprocess.run(
             [
                 "cargo", "build", "--locked", "--message-format=json-render-diagnostics",
-                "-p", "openarm-simulator-rs", "-p", "openarm-test-model",
+                "-p", "openarm-simulator", "-p", "openarm-test-model",
             ],
             cwd=repo, stdout=subprocess.PIPE, text=True, check=True,
         )
@@ -34,7 +34,7 @@ class ClientTest(unittest.TestCase):
             if not line.startswith("{"):
                 continue
             message = json.loads(line)
-            if message.get("target", {}).get("name") == "openarm-simulator-rs":
+            if message.get("target", {}).get("name") == "openarm-simulator":
                 binary = message["executable"]
             for key, value in message.get("env", []):
                 if key == "OPENARM_TEST_MODEL":

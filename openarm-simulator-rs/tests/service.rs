@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BINARY: &str = env!("CARGO_BIN_EXE_openarm-simulator-rs");
+const BINARY: &str = env!("CARGO_BIN_EXE_openarm-simulator");
 
 fn http_response(reader: &mut BufReader<TcpStream>, status: u16) -> Value {
     let mut line = String::new();
@@ -968,7 +968,7 @@ fn can_client_codec_and_socket_errors() {
     if !in_can_namespace("can_client_codec_and_socket_errors") {
         return;
     }
-    use damiao_can_rs::{ControlMode, Feedback, MappingRanges, MotorStatus, Request};
+    use damiao_can::{ControlMode, Feedback, MappingRanges, MotorStatus, Request};
     let mut service = Running::start(command(openarm_test_model::CONFIG).args([
         "--model",
         openarm_test_model::SCENE,

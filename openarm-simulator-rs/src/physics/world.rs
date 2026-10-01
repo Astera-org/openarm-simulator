@@ -2,12 +2,12 @@
 use super::{Loads, VariableFriction, friction, spring_geometry};
 use crate::config::Config;
 use anyhow::{Context, Result, ensure};
-use damiao_simulator_rs::{Drive, ShaftState};
-use mujoco_rs::{
+use damiao_simulator::{Drive, ShaftState};
+use mujoco::{
     ActuatorIndex, BodyIndex, Data, GeomIndex, JointIndex, JointKind, Model, NBIAS, NIMP, NREF,
     SiteIndex,
 };
-use openarm_simulator_core_rs::{
+use openarm_simulator_core::{
     AppliedForce, BodyState, SceneNames, SiteState, Spring, SpringState,
     mint::Quaternion,
     uom::si::{
@@ -26,7 +26,7 @@ use openarm_simulator_core_rs::{
         velocity::meter_per_second,
     },
 };
-use openarm_simulator_core_rs::{
+use openarm_simulator_core::{
     BodyParameters, HingeJointParameters, JointParameters, PhysicsConfiguration, Plant, Push,
     SlideJointParameters,
 };
@@ -341,7 +341,7 @@ impl Physics {
     }
 
     pub fn version() -> String {
-        mujoco_rs::version()
+        mujoco::version()
     }
 
     pub fn push(&mut self, forces: Push) -> Result<()> {
@@ -563,7 +563,7 @@ fn quaternion(q: [f64; 4]) -> Quaternion<f64> {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_TIMESTEP_NS;
-    use openarm_simulator_core_rs::Stribeck;
+    use openarm_simulator_core::Stribeck;
     const STEP: f64 = DEFAULT_TIMESTEP_NS as f64 / 1_000_000_000.;
     #[allow(clippy::approx_constant)]
     const RADIUS: f64 = 0.044 / 1.0472;
@@ -603,7 +603,7 @@ mod tests {
     }
 
     use crate::simulation::Simulation;
-    use damiao_can_rs::{MitCommand, MotorStatus};
+    use damiao_can::{MitCommand, MotorStatus};
     #[test]
     fn arbitrary_scene_names_gearing_and_unmapped_actuators() {
         let xml = br#"<mujoco>
@@ -809,7 +809,7 @@ mod tests {
                         ),
                         stiffness: Some(Force::new::<newton>(2.) / Length::new::<meter>(1.)),
                         springref: Some(Length::new::<
-                            openarm_simulator_core_rs::uom::si::length::centimeter,
+                            openarm_simulator_core::uom::si::length::centimeter,
                         >(1.)),
                     }),
                 ),
@@ -932,7 +932,7 @@ mod tests {
         for sign in [-1., 1.] {
             let law = Stribeck {
                 direction_asymmetry: 0.25,
-                angle: Some(openarm_simulator_core_rs::AngleModulation {
+                angle: Some(openarm_simulator_core::AngleModulation {
                     amplitude: 0.3,
                     harmonic: 2,
                     phase: Angle::new::<radian>(0.4),
@@ -1009,7 +1009,7 @@ mod tests {
             let mut p = friction_world(
                 Some(Stribeck {
                     direction_asymmetry: -0.2,
-                    angle: Some(openarm_simulator_core_rs::AngleModulation {
+                    angle: Some(openarm_simulator_core::AngleModulation {
                         amplitude: 0.25,
                         harmonic: 2,
                         phase: Angle::new::<radian>(-0.3),

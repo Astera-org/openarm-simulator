@@ -217,7 +217,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "damiao-can-rs"
+name = "damiao-can"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -225,10 +225,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "damiao-simulator-rs"
+name = "damiao-simulator"
 version = "0.1.0"
 dependencies = [
- "damiao-can-rs",
+ "damiao-can",
  "serde",
  "thiserror",
 ]
@@ -265,7 +265,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "download-cache-rs"
+name = "download-cache"
 version = "0.1.0"
 dependencies = [
  "directories",
@@ -547,28 +547,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "mujoco-core-rs"
+name = "mujoco"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mujoco-core",
+ "mujoco-sys",
+ "tempfile",
+]
+
+[[package]]
+name = "mujoco-core"
 version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
-name = "mujoco-rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "mujoco-core-rs",
- "mujoco-sys-rs",
- "tempfile",
-]
-
-[[package]]
-name = "mujoco-sys-rs"
+name = "mujoco-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen",
- "download-cache-rs",
+ "download-cache",
  "tempfile",
 ]
 
@@ -664,47 +664,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openarm-simulator-client-rs"
-version = "0.1.0"
-dependencies = [
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "openarm-simulator-core-rs",
- "openarm-test-model",
- "percent-encoding",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "openarm-simulator-core-rs"
-version = "0.1.0"
-dependencies = [
- "damiao-can-rs",
- "mint",
- "mujoco-core-rs",
- "serde",
- "uom",
-]
-
-[[package]]
-name = "openarm-simulator-rs"
+name = "openarm-simulator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "damiao-can-rs",
- "damiao-simulator-rs",
+ "damiao-can",
+ "damiao-simulator",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
- "mujoco-rs",
- "openarm-simulator-core-rs",
+ "mujoco",
+ "openarm-simulator-core",
  "openarm-test-model",
  "percent-encoding",
  "serde",
@@ -718,10 +690,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "openarm-simulator-client"
+version = "0.1.0"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "openarm-simulator-core",
+ "openarm-test-model",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "openarm-simulator-core"
+version = "0.1.0"
+dependencies = [
+ "damiao-can",
+ "mint",
+ "mujoco-core",
+ "serde",
+ "uom",
+]
+
+[[package]]
 name = "openarm-test-model"
 version = "0.1.0"
 dependencies = [
- "download-cache-rs",
+ "download-cache",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 use crate::{config::Config, physics::Physics};
 use anyhow::{Context, Result, ensure};
-use damiao_simulator_rs::Motor;
-use mujoco_rs::Model;
-use openarm_simulator_core_rs::{
+use damiao_simulator::Motor;
+use mujoco::Model;
+use openarm_simulator_core::{
     MotorState, MotorStates,
     uom::si::{
         angle::radian,
@@ -111,7 +111,7 @@ impl Simulation {
         Ok(&mut self.motors[index])
     }
 
-    pub fn push(&mut self, torques: openarm_simulator_core_rs::Push) -> Result<()> {
+    pub fn push(&mut self, torques: openarm_simulator_core::Push) -> Result<()> {
         self.physics.push(torques)
     }
 }
@@ -139,8 +139,8 @@ fn motor_snapshot(motor: &Motor) -> MotorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use damiao_can_rs::{Feedback, MappingRanges, MitCommand, MotorStatus};
-    use damiao_simulator_rs::MotorConfig;
+    use damiao_can::{Feedback, MappingRanges, MitCommand, MotorStatus};
+    use damiao_simulator::MotorConfig;
     #[test]
     fn snapshot_and_can_feedback_preserve_motor_fields() {
         let mut motor = Motor::new(MotorConfig {
@@ -187,7 +187,7 @@ mod tests {
         );
         let restored: MotorState = serde_json::from_value(json).unwrap();
         assert_eq!(
-            damiao_can_rs::MitCommand::from(restored.command),
+            damiao_can::MitCommand::from(restored.command),
             motor.command
         );
         assert_eq!(restored, snapshot);

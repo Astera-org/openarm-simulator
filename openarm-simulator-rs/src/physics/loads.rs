@@ -1,5 +1,5 @@
-use mujoco_rs::{AppliedForces, Site};
-use openarm_simulator_core_rs::{
+use mujoco::{AppliedForces, Site};
+use openarm_simulator_core::{
     AppliedForce, Spring,
     uom::si::{
         f64::{Force, Torque},

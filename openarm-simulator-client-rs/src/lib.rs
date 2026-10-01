@@ -18,7 +18,7 @@ use models::{
     Advance, AppliedForce, Configuration, ErrorResponse, Fault, Push, PushRequest, SceneNames,
     Spring, State,
 };
-pub use openarm_simulator_core_rs as models;
+pub use openarm_simulator_core as models;
 use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]

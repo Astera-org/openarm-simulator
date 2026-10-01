@@ -1,5 +1,5 @@
 [package]
-name = "openarm-simulator-client-rs"
+name = "openarm-simulator-client"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 percent-encoding = "2"
-openarm-simulator-core-rs = { path = "../openarm-simulator-core-rs" }
+openarm-simulator-core = { path = "../openarm-simulator-core-rs" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

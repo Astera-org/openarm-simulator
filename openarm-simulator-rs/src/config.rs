@@ -1,6 +1,6 @@
-use damiao_simulator_rs::MotorConfig;
-use openarm_simulator_core_rs::uom::si::f64::Angle;
-use openarm_simulator_core_rs::{BodyParameters, JointParameters};
+use damiao_simulator::MotorConfig;
+use openarm_simulator_core::uom::si::f64::Angle;
+use openarm_simulator_core::{BodyParameters, JointParameters};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 

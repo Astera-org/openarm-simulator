@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 
 //! Damiao motor-controller emulation. Mechanical observations are supplied by the caller.
-use damiao_can_rs::{
+use damiao_can::{
     ControlMode, Feedback, MappingRanges, MitCommand, MotorStatus, REGISTER_CAN_ID,
     RegisterAddress, Request,
 };
@@ -12,7 +12,7 @@ type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Protocol(#[from] damiao_can_rs::Error),
+    Protocol(#[from] damiao_can::Error),
     #[error("reply ID must be a standard CAN ID distinct from the motor and register IDs")]
     InvalidReplyId,
     #[error("mapping ranges must be positive finite float32 register values")]
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn unsupported_modes_leave_the_motor_unchanged() {
-        use damiao_can_rs::{PositionForceCommand, PositionVelocityCommand, VelocityCommand};
+        use damiao_can::{PositionForceCommand, PositionVelocityCommand, VelocityCommand};
         let mut motor = motor(7, 30., 10.);
         motor.command = MitCommand {
             kp: 4.,
