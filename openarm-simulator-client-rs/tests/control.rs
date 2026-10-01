@@ -66,6 +66,7 @@ fn control_api_against_simulator() {
     ] {
         command.env_remove(key);
     }
+    command.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG);
     unsafe {
         command.pre_exec(move || {
             let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -156,14 +157,13 @@ fn control_api_against_simulator() {
                 .unwrap();
             assert_eq!(unknown.state["left_joint1"].status, MotorStatus(2));
             let pushed = client
-                .push(Push {
-                    left: Some([0.1; 7]),
-                    right: None,
-                })
+                .push(Push::from([("openarm_left_joint7".into(), 0.1)]))
                 .await
                 .unwrap();
-            assert_eq!(pushed.plant.applied_torque_nm.left, [0.1; 7]);
-            assert_eq!(pushed.plant.applied_torque_nm.right, [0.; 7]);
+            assert_eq!(
+                pushed.plant.applied_torque_nm,
+                Push::from([("openarm_left_joint7".into(), 0.1)])
+            );
             assert_eq!(client.reset().await.unwrap(), StatusCode::OK);
             assert_eq!(client.state().await.unwrap(), initial);
             assert_eq!(client.unpause().await.unwrap(), StatusCode::OK);
@@ -190,10 +190,7 @@ fn control_api_against_simulator() {
             ));
             assert!(matches!(
                 client
-                    .push(Push {
-                        left: Some([f64::NAN; 7]),
-                        right: None
-                    })
+                    .push(Push::from([("openarm_left_joint7".into(), f64::NAN)]))
                     .await,
                 Err(Error::InvalidRequest(_))
             ));

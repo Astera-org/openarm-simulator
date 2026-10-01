@@ -1,4 +1,5 @@
 mod clock;
+mod config;
 mod friction;
 mod http;
 mod motor;
@@ -21,11 +22,11 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "OpenArm MuJoCo CAN motor simulator with HTTP administration",
-    after_help = "Motor commands use CAN only. HTTP: GET /state, GET /configuration, POST /fault, /push, /reset, /pause, /unpause, /advance.\nClock starts paused; reset restores startup state and pauses. POST /advance accepts {\"duration_ns\": <integer>} while paused. Clock mutations return empty 200 responses, or 204 for an unchanged pause/unpause; 409 means clock state conflict.\nInherited descriptors must survive exec. HTTP also accepts LISTEN_FDS=1, LISTEN_PID, and LISTEN_FDS_FIRST_FD (default 3).\nBuild: cargo build --release (downloads pinned MuJoCo unless MUJOCO_DIR is set).\nTests: cargo test (also provisions the pinned model; requires Linux user/network namespaces, vcan and iproute2)."
+    about = "MuJoCo scene with configured Damiao CAN motors and HTTP administration",
+    after_help = "Motor commands use CAN only. Supply --config with named buses and motors; see config/openarm-v1.json for the OpenArm setup and models/openarm-v1.xml for its shaft transmissions. A binding's actuator transmission length represents shaft angle in radians. HTTP: GET /state, GET /configuration, POST /fault, /push, /reset, /pause, /unpause, /advance.\nClock starts paused; reset restores startup state and pauses. POST /advance accepts {\"duration_ns\": <integer>} while paused. Clock mutations return empty 200 responses, or 204 for an unchanged pause/unpause; 409 means clock state conflict.\nInherited descriptors must survive exec. HTTP also accepts LISTEN_FDS=1, LISTEN_PID, and LISTEN_FDS_FIRST_FD (default 3).\nBuild: cargo build --release (downloads pinned MuJoCo unless MUJOCO_DIR is set).\nTests: cargo test (also provisions the pinned model; requires Linux user/network namespaces, vcan and iproute2)."
 )]
 struct Args {
-    /// External OpenArm v1 scene.xml, including its referenced meshes
+    /// External MJCF scene, including its referenced meshes
     #[arg(long, env = "OPENARM_SIMULATOR_MODEL")]
     model: PathBuf,
     #[arg(long, default_value = "127.0.0.1")]
@@ -44,7 +45,7 @@ struct Args {
     /// Readable pipe/socket; EOF stops the simulator
     #[arg(long)]
     parent_fd: Option<RawFd>,
-    /// Startup JSON: timestep_ns (default 500000), poses, offsets, bodies, joints, friction_scale
+    /// Startup JSON: buses, named motors, timestep_ns, positions, bodies, joints, friction_scale
     #[arg(long, env = "OPENARM_SIMULATOR_CONFIG")]
     config: Option<PathBuf>,
     /// Write simulator.json on shutdown
@@ -71,17 +72,12 @@ fn read_json(path: &Path) -> Result<Value> {
     .with_context(|| format!("parse {}", path.display()))
 }
 
-fn configuration(path: Option<&Path>) -> Result<physics::Config> {
+fn configuration(path: Option<&Path>) -> Result<config::Config> {
     let value = match path {
         Some(path) => read_json(path)?,
         None => json!({}),
     };
     ensure!(value.is_object(), "Simulator config must be a JSON object");
-    for field in ["poses", "offsets"] {
-        if let Some(arms) = value.get(field) {
-            ensure!(arms.is_object(), "{field} must be an object keyed by arm");
-        }
-    }
     Ok(serde_json::from_value(value)?)
 }
 

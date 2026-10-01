@@ -27,7 +27,7 @@ FOR CHOSEN OPTION.
   controller settings, address conflicts, and bindings at their respective
   boundaries. Reset restores initial controller settings. Motor names, CAN
   addresses, and scene names remain distinct identities.
-- [ ] 5. Remove fixed arm arrays and scene-name assumptions. Resolve configured
+- [x] 5. Remove fixed arm arrays and scene-name assumptions. Resolve configured
   actuator/transmission bindings; move OpenArm gripper/contact adjustments into
   the supplied model. Only mapped actuators are adapted for motor emulation.
   Test a small scene with different names and motor count, retaining OpenArm
@@ -67,3 +67,23 @@ interface; do not add a standalone mode or backend framework for that purpose.
 
 Generic scene inspection, pose editing, disturbances, additional motor protocols,
 dynamic plugins, and a general physics-plugin framework are separate work.
+
+## Using the extracted configuration
+
+Supply `--model /path/to/scene.xml --config openarm-simulator-rs/config/openarm-v1.json`
+for OpenArm. The supplied `openarm-simulator-rs/models/openarm-v1.xml` expects the
+pinned upstream `v1/meshes` directory beside it; copy the XML into that external
+model directory and load it directly, or include it from your scene. Tests stage
+the XML against cached meshes automatically. No configuration means no emulated
+motors or CAN buses.
+
+The OpenArm preset retains the previous motor assignments and mapping ranges
+(DM8009: 12.5/45/54, DM4340: 12.5/10/28, DM4310: 12.5/30/10), inherited from
+`enactic/openarm_can`'s motor presets. Command/reply IDs follow
+`enactic/openarm_ros2@4e837e1d0dae692ff67b560b69d8d281d7a8d4ed`,
+`openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp`.
+
+Use repeatable `--can-interface BUS=INTERFACE` or `--can-fd BUS=FD` for configured
+buses. State entries and `/fault` identify motors by configuration name;
+`/push` accepts a map from scene hinge-joint names to torques in Nm. Startup
+`positions` likewise uses scene hinge/slide names. Both clients use these models.

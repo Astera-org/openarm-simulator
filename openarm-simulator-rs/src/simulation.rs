@@ -1,16 +1,12 @@
-use crate::{
-    motor,
-    physics::{Config, Physics},
-};
+use crate::{config::Config, motor, physics::Physics};
 use anyhow::{Context, Result, ensure};
-use damiao_simulator_rs::{Drive, Motor};
+use damiao_simulator_rs::Motor;
 use openarm_simulator_core_rs::MotorStates;
 use std::{collections::BTreeSet, path::Path};
 
 pub struct Binding {
     pub name: String,
     pub bus: usize,
-    pub port: (usize, usize),
 }
 
 pub struct Simulation {
@@ -50,14 +46,9 @@ impl Simulation {
             bindings.push(Binding {
                 name: name.clone(),
                 bus,
-                port: (0, 0),
             });
         }
-        let names: Vec<_> = config.motors.values().map(|b| b.actuator.clone()).collect();
-        let physics = Physics::load(path, config)?;
-        for (binding, name) in bindings.iter_mut().zip(names) {
-            binding.port = physics.port(&name)?;
-        }
+        let physics = Physics::load(path, &config)?;
         let mut simulation = Self {
             physics,
             motors,
@@ -77,19 +68,15 @@ impl Simulation {
     }
 
     pub fn step(&mut self, count: u64) -> Result<()> {
-        let mut drives = [[Drive::default(); 8]; 2];
-        for (binding, motor) in self.bindings.iter().zip(&self.motors) {
-            drives[binding.port.0][binding.port.1] = motor.drive();
-        }
+        let drives: Vec<_> = self.motors.iter().map(Motor::drive).collect();
         self.physics.step(count, &drives)?;
         self.observe();
         Ok(())
     }
 
     fn observe(&mut self) {
-        let observations = self.physics.observations();
-        for (binding, motor) in self.bindings.iter().zip(&mut self.motors) {
-            motor.observe(observations[binding.port.0][binding.port.1]);
+        for (motor, observation) in self.motors.iter_mut().zip(self.physics.observations()) {
+            motor.observe(observation);
         }
     }
 
@@ -110,7 +97,7 @@ impl Simulation {
         Ok(&mut self.motors[index])
     }
 
-    pub fn push(&mut self, torques: [[f64; 7]; 2]) -> Result<()> {
+    pub fn push(&mut self, torques: openarm_simulator_core_rs::Push) -> Result<()> {
         self.physics.push(torques)
     }
 }

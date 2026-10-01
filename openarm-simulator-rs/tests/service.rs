@@ -76,6 +76,7 @@ fn command() -> Command {
     ] {
         command.env_remove(key);
     }
+    command.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG);
     command
 }
 
@@ -241,9 +242,9 @@ fn host_listener_private_namespace() {
         cmd.args(["--user", "--map-root-user", "--net", "sh", "-ec",
             "ip link set lo up; ip link add rightbus type vcan; ip link set rightbus mtu 72 up; ip link add leftbus type vcan; ip link set leftbus mtu 72 up; exec \"$@\"", "namespace", BINARY,
             "--model", model, "--can-interface", "left=leftbus", "--can-interface", "right=rightbus", "--parent-fd", &lifetime.as_raw_fd().to_string()]);
-        cmd.env_remove("LISTEN_FDS")
-            .env_remove("LISTEN_PID")
-            .env_remove("OPENARM_SIMULATOR_CONFIG");
+        cmd.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG)
+            .env_remove("LISTEN_FDS")
+            .env_remove("LISTEN_PID");
         if activation {
             cmd.env("LISTEN_FDS", "1")
                 .env("LISTEN_FDS_FIRST_FD", listener.as_raw_fd().to_string());
@@ -481,20 +482,17 @@ fn can_http_and_lifecycle() {
         );
         service.post("/command", json!({}), 404);
         service.post("/step", json!({}), 404);
-        service.post("/push", json!({"right": ([0.1; 7])}), 200);
+        service.post("/push", json!({"openarm_right_joint7": 0.1}), 200);
         let state = service.get("/state");
         assert_eq!(
-            state["plant"]["applied_torque_nm"]["right"],
-            json!(([0.1; 7]))
+            state["plant"]["applied_torque_nm"],
+            json!({"openarm_right_joint7": 0.1})
         );
         assert!(state["statistics"]["commands"].as_u64().unwrap() >= 10);
         service.clock("/reset", 200);
         let state = service.get("/state");
         assert_eq!(state["time_ns"], 0);
-        assert_eq!(
-            state["plant"]["applied_torque_nm"]["right"],
-            json!(([0.; 7]))
-        );
+        assert_eq!(state["plant"]["applied_torque_nm"], json!({}));
         assert!(
             state["state"]
                 .as_object()
@@ -611,6 +609,7 @@ fn reject_bad_can(model: &str) {
         rejected(cmd, &[right, left], reason);
     }
     let mut foreign = Command::new("unshare");
+    foreign.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG);
     foreign.args(["--user", "--map-root-user", "--net", "sh", "-ec",
         "for bus in can0 can1; do ip link add \"$bus\" type vcan; ip link set \"$bus\" mtu 72 up; done; exec \"$@\"", "namespace", BINARY,
         "--model", model, "--port", "0", "--host", "0.0.0.0", "--can-fd", &format!("right={}", buses[0].as_raw_fd()), "--can-fd", &format!("left={}", buses[1].as_raw_fd())]);
@@ -658,15 +657,11 @@ fn clock_start_reset_and_fixed_updates() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("plant.json");
     let period = 250_000u64;
-    fs::write(
-        &config,
-        json!({
-            "timestep_ns": period,
-            "poses": {"left": [0., 0., 0., 0., 0., 0., 0.25, -0.2]}
-        })
-        .to_string(),
-    )
-    .unwrap();
+    let mut settings: Value =
+        serde_json::from_str(&fs::read_to_string(openarm_test_model::CONFIG).unwrap()).unwrap();
+    settings["timestep_ns"] = json!(period);
+    settings["positions"]["openarm_left_joint7"] = json!(0.25);
+    fs::write(&config, settings.to_string()).unwrap();
     let mut service = Running::start(command().args([
         "--model",
         openarm_test_model::SCENE,
@@ -719,7 +714,7 @@ fn clock_start_reset_and_fixed_updates() {
         json!(["left_joint7", {"status": 9, "silent": true}]),
         200,
     );
-    service.post("/push", json!({"left": ([0.1; 7])}), 200);
+    service.post("/push", json!({"openarm_left_joint7": 0.1}), 200);
     service.clock("/unpause", 200);
     service.clock("/unpause", 204);
     service.post("/advance", json!({"duration_ns": 1}), 409);

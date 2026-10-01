@@ -1,15 +1,12 @@
 """Wire models for simulator administration. Motor commands are sent over CAN."""
 
-from typing import Literal
-
 from serde import serde
 
-Arm = Literal["left", "right"]
 Vector3 = tuple[float, float, float]
-Pose = tuple[float, float, float, float, float, float, float, float]
-JointTorques = tuple[float, float, float, float, float, float, float]
 Solref = tuple[float, float]
 Solimp = tuple[float, float, float, float, float]
+# Persistent hinge-joint torques in Nm; omitted joints receive zero.
+Push = dict[str, float]
 
 
 @serde
@@ -17,14 +14,6 @@ class Advance:
     """Elapsed simulated nanoseconds; the clock must be paused."""
 
     duration_ns: int
-
-
-@serde
-class Push:
-    """Persistent external joint torques in Nm; omitted arms receive zero torque."""
-
-    left: JointTorques | None = None
-    right: JointTorques | None = None
 
 
 @serde
@@ -73,18 +62,6 @@ class MotorState:
 
 
 @serde
-class ArmTorques:
-    left: JointTorques
-    right: JointTorques
-
-
-@serde
-class ArmPoses:
-    left: Pose
-    right: Pose
-
-
-@serde
 class Statistics:
     commands: int
     replies: int
@@ -129,7 +106,7 @@ class BodyParameters:
 class Plant:
     friction_model: str
     joints: dict[str, JointParameters]
-    applied_torque_nm: ArmTorques
+    applied_torque_nm: dict[str, float]
 
 
 @serde
@@ -142,8 +119,6 @@ class State:
     mujoco_version: str
     timestep_ns: int
     plant: Plant
-    joint_stop_solref: Solref
-    joint_stop_solimp: Solimp
 
 
 @serde
@@ -153,14 +128,11 @@ class PhysicsConfiguration:
     timestep_ns: int
     integrator: str
     gravity_m_s2: Vector3
-    joint_stop_solref: Solref
-    joint_stop_solimp: Solimp
     enhanced_friction_solref: Solref
     enhanced_friction_solimp: Solimp
-    gripper_radius_m: float
     joints: dict[str, JointParameters]
     bodies: dict[str, BodyParameters]
-    encoder_offsets_rad: ArmPoses
+    encoder_offsets_rad: dict[str, float]
 
 
 @serde

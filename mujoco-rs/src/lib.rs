@@ -75,55 +75,6 @@ impl Spec {
                 .into_owned()
         })?))
     }
-    pub fn exclude_contact(&mut self, first: &str, second: &str) -> Result<()> {
-        let (first, second) = (CString::new(first)?, CString::new(second)?);
-        unsafe {
-            let exclusion = NonNull::new(ffi::mjs_addExclude(self.0.as_ptr()))
-                .context("could not add contact exclusion")?;
-            ffi::mjs_setString(exclusion.as_ref().bodyname1, first.as_ptr());
-            ffi::mjs_setString(exclusion.as_ref().bodyname2, second.as_ptr());
-        }
-        Ok(())
-    }
-    fn actuator(&self, name: &str) -> Result<NonNull<ffi::mjsActuator>> {
-        let name = CString::new(name)?;
-        unsafe {
-            let element = ffi::mjs_findElement(self.0.as_ptr(), ffi::mjOBJ_ACTUATOR, name.as_ptr());
-            ensure!(!element.is_null(), "missing actuator {name:?}");
-            NonNull::new(ffi::mjs_asActuator(element)).context("wrong element type")
-        }
-    }
-    pub fn actuator_force_range(&self, name: &str) -> Result<[f64; 2]> {
-        Ok(unsafe { self.actuator(name)?.as_ref().forcerange })
-    }
-    pub fn set_actuator_tendon(
-        &mut self,
-        name: &str,
-        tendon: &str,
-        gear: f64,
-        force_range: [f64; 2],
-    ) -> Result<()> {
-        let tendon = CString::new(tendon)?;
-        unsafe {
-            let mut actuator = self.actuator(name)?;
-            let a = actuator.as_mut();
-            a.trntype = ffi::mjTRN_TENDON;
-            ffi::mjs_setString(a.target, tendon.as_ptr());
-            a.gear[0] = gear;
-            a.forcerange = force_range;
-        }
-        Ok(())
-    }
-    pub fn remove_actuator(&mut self, name: &str) -> Result<()> {
-        unsafe {
-            let actuator = self.actuator(name)?;
-            ensure!(
-                ffi::mjs_delete(self.0.as_ptr(), actuator.as_ref().element) == 0,
-                "could not remove actuator {name}"
-            );
-        }
-        Ok(())
-    }
     pub fn compile(&mut self) -> Result<Model> {
         let raw = unsafe { ffi::mj_compile(self.0.as_ptr(), std::ptr::null()) };
         Ok(Model {
@@ -178,11 +129,6 @@ impl Model {
         }
         Ok(())
     }
-    pub fn use_implicit_fast(&mut self) {
-        unsafe {
-            self.raw.as_mut().opt.integrator = ffi::mjINT_IMPLICITFAST as i32;
-        }
-    }
     pub fn gravity(&self) -> [f64; 3] {
         unsafe { self.raw.as_ref().opt.gravity }
     }
@@ -198,19 +144,37 @@ impl Model {
             self.raw.as_mut().opt.disableflags |= (ffi::mjDSBL_CONTACT | ffi::mjDSBL_LIMIT) as i32;
         }
     }
-    pub fn use_affine_actuators(&mut self) {
+    /// Configure a stateless scalar actuator for an affine force law.
+    pub fn use_affine_actuator(&mut self, actuator: usize) -> Result<()> {
+        let m = unsafe { self.raw.as_mut() };
+        ensure!(actuator < m.nactuator as usize, "invalid actuator index");
         unsafe {
-            let m = self.raw.as_mut();
-            slice_mut(m.actuator_gaintype, m.nactuator as usize).fill(ffi::mjGAIN_FIXED as i32);
-            slice_mut(m.actuator_biastype, m.nactuator as usize).fill(ffi::mjBIAS_AFFINE as i32);
-            slice_mut(m.actuator_gainprm, m.nactuator as usize * NGAIN)
-                .chunks_mut(NGAIN)
-                .for_each(|a| {
-                    a.fill(0.);
-                    a[0] = 1.;
-                });
-            slice_mut(m.actuator_biasprm, m.nactuator as usize * NBIAS).fill(0.);
-            slice_mut(m.actuator_ctrllimited, m.nu as usize).fill(false);
+            ensure!(
+                *m.actuator_ctrlnum.add(actuator) == 1
+                    && *m.actuator_outnum.add(actuator) == 1
+                    && *m.actuator_actadr.add(actuator) == -1
+                    && *m.actuator_plugin.add(actuator) == -1,
+                "motor binding requires a stateless scalar actuator without a plugin"
+            );
+            *m.actuator_gaintype.add(actuator) = ffi::mjGAIN_FIXED as i32;
+            *m.actuator_biastype.add(actuator) = ffi::mjBIAS_AFFINE as i32;
+            let gain = slice_mut(m.actuator_gainprm.add(actuator * NGAIN), NGAIN);
+            gain.fill(0.);
+            gain[0] = 1.;
+            slice_mut(m.actuator_biasprm.add(actuator * NBIAS), NBIAS).fill(0.);
+            *m.actuator_ctrllimited
+                .add(*m.actuator_ctrladr.add(actuator) as usize) = false;
+        }
+        Ok(())
+    }
+
+    pub fn integrator(&self) -> &'static str {
+        match unsafe { self.raw.as_ref().opt.integrator } {
+            x if x == ffi::mjINT_EULER as i32 => "Euler",
+            x if x == ffi::mjINT_RK4 as i32 => "RK4",
+            x if x == ffi::mjINT_IMPLICIT as i32 => "implicit",
+            x if x == ffi::mjINT_IMPLICITFAST as i32 => "implicitfast",
+            _ => "unknown",
         }
     }
 }
@@ -353,6 +317,8 @@ impl Model {
 }
 
 pub struct DataRef<'a> {
+    pub actuator_length: &'a [f64],
+    pub actuator_velocity: &'a [f64],
     pub qpos: &'a [f64],
     pub qvel: &'a [f64],
     pub ctrl: &'a [f64],
@@ -418,6 +384,8 @@ impl Data {
         unsafe {
             let d = self.raw.as_ref();
             DataRef {
+                actuator_length: slice_ref(d.actuator_length, self.nout),
+                actuator_velocity: slice_ref(d.actuator_velocity, self.nout),
                 qpos: slice_ref(d.qpos, self.nq),
                 qvel: slice_ref(d.qvel, self.nv),
                 ctrl: slice_ref(d.ctrl, self.nu),

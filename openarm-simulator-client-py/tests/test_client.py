@@ -16,7 +16,7 @@ import unittest
 from serde.json import from_json, to_json
 
 from openarm_simulator_client import APIError, Client
-from openarm_simulator_client.models import Configuration, Fault, MappingRanges, MotorCommand, Push, State
+from openarm_simulator_client.models import Configuration, Fault, MappingRanges, MotorCommand, State
 
 
 class ClientTest(unittest.TestCase):
@@ -47,6 +47,7 @@ class ClientTest(unittest.TestCase):
             "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDS_FIRST_FD", "OPENARM_SIMULATOR_CONFIG",
         ):
             env.pop(key, None)
+        env["OPENARM_SIMULATOR_CONFIG"] = str(repo / "openarm-simulator-rs/config/openarm-v1.json")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             listener.listen()
@@ -77,7 +78,7 @@ class ClientTest(unittest.TestCase):
                 self.assertEqual(state.state["left_joint1"].ranges, MappingRanges(12.5, 45.0, 54.0))
                 self.assertEqual(state.state["left_joint1"].mos_temperature, 25)
                 self.assertEqual(state.state["left_joint1"].rotor_temperature, 25)
-                self.assertIsInstance(configuration.configuration.encoder_offsets_rad.left, tuple)
+                self.assertIsInstance(configuration.configuration.encoder_offsets_rad, dict)
                 self.assertEqual(state.timestep_ns, configuration.configuration.timestep_ns)
 
                 fault = client.fault("left_joint1", Fault(status=9, silent=True))
@@ -90,9 +91,8 @@ class ClientTest(unittest.TestCase):
                 self.assertEqual(cleared.state["left_joint1"].status, 0)
                 self.assertFalse(cleared.state["left_joint1"].silent)
 
-                push = client.push(Push(left=(0.1,) * 7))
-                self.assertEqual(push.plant.applied_torque_nm.left, (0.1,) * 7)
-                self.assertEqual(push.plant.applied_torque_nm.right, (0.0,) * 7)
+                push = client.push({"openarm_left_joint7": 0.1})
+                self.assertEqual(push.plant.applied_torque_nm, {"openarm_left_joint7": 0.1})
                 self.assertEqual(client.reset(), HTTPStatus.OK)
                 self.assertEqual(client.state(), state)
                 self.assertTrue(state.paused)
@@ -120,7 +120,7 @@ class ClientTest(unittest.TestCase):
                     client.fault("left_joint0", Fault(status=9))
                 self.assertEqual(error.exception.status, 400)
                 with self.assertRaises(ValueError):
-                    client.push(Push(left=(float("nan"),) * 7))
+                    client.push({"openarm_left_joint7": float("nan")})
         finally:
             process.terminate()
             try:

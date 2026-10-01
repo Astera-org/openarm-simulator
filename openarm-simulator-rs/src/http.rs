@@ -118,7 +118,7 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
         "/push" => {
             ensure!(
                 payload.is_object(),
-                "payload must be an object keyed by arm"
+                "payload must be an object keyed by joint name"
             );
             AdminRequest::Push {
                 payload: serde_json::from_value(payload)?,

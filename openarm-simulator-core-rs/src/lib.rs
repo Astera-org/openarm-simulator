@@ -4,35 +4,11 @@ pub use damiao_can_rs::{MappingRanges, MitCommand as MotorCommand, MotorStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Arm {
-    Left,
-    Right,
-}
-
-pub type Pose = [f64; 8];
-pub type JointTorques = [f64; 7];
 pub type Solref = [f64; 2];
 pub type Solimp = [f64; 5];
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct Arms<T> {
-    pub left: T,
-    pub right: T,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArmOptions<T> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub left: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub right: Option<T>,
-}
-
-/// Persistent external torques in Nm. Omitted arms receive zero torque.
-pub type Push = ArmOptions<JointTorques>;
+/// Persistent torques in Nm, keyed by scene hinge-joint name. Omitted joints receive zero.
+pub type Push = BTreeMap<String, f64>;
 
 /// Patch a motor's fault. None leaves the field unchanged; status 0 clears the
 /// fault and disables the motor. Enabling a motor remains a CAN operation.
@@ -120,7 +96,7 @@ pub struct BodyParameters {
 pub struct Plant {
     pub friction_model: String,
     pub joints: BTreeMap<String, JointParameters>,
-    pub applied_torque_nm: Arms<JointTorques>,
+    pub applied_torque_nm: Push,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct State {
@@ -132,8 +108,6 @@ pub struct State {
     pub mujoco_version: String,
     pub timestep_ns: u64,
     pub plant: Plant,
-    pub joint_stop_solref: Solref,
-    pub joint_stop_solimp: Solimp,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct PhysicsConfiguration {
@@ -142,14 +116,11 @@ pub struct PhysicsConfiguration {
     pub timestep_ns: u64,
     pub integrator: String,
     pub gravity_m_s2: [f64; 3],
-    pub joint_stop_solref: Solref,
-    pub joint_stop_solimp: Solimp,
     pub enhanced_friction_solref: Solref,
     pub enhanced_friction_solimp: Solimp,
-    pub gripper_radius_m: f64,
     pub joints: BTreeMap<String, JointParameters>,
     pub bodies: BTreeMap<String, BodyParameters>,
-    pub encoder_offsets_rad: Arms<Pose>,
+    pub encoder_offsets_rad: BTreeMap<String, f64>,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Configuration {

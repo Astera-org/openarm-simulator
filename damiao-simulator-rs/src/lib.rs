@@ -269,6 +269,15 @@ mod tests {
         motor.silent = true;
         motor.reset();
         assert_eq!(motor, Motor::new(config).unwrap());
+        let normalized = Motor::new(MotorConfig {
+            ranges: MappingRanges {
+                pmax: 0.1,
+                ..config.ranges
+            },
+            ..config
+        })
+        .unwrap();
+        assert_eq!(normalized.ranges.pmax, f64::from(0.1f32));
         for invalid in [
             MotorConfig {
                 id: 0x7ff,

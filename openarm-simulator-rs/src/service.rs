@@ -208,10 +208,7 @@ fn administer(physics: &mut Simulation, request: Request) -> Result<()> {
         Request::Reset | Request::Pause | Request::Unpause | Request::Advance { .. } => {
             unreachable!()
         }
-        Request::Push { payload } => physics.push([
-            payload.right.unwrap_or([0.; 7]),
-            payload.left.unwrap_or([0.; 7]),
-        ])?,
+        Request::Push { payload } => physics.push(payload)?,
         Request::Fault {
             payload: (name, fault),
         } => {
@@ -381,8 +378,6 @@ fn snapshot(
         mujoco_version: Physics::version(),
         timestep_ns: physics.physics.timestep_ns,
         plant: physics.physics.parameters(),
-        joint_stop_solref: [0.002, 1.],
-        joint_stop_solimp: [0.99, 0.999, 0.001, 0.5, 2.],
     }
 }
 

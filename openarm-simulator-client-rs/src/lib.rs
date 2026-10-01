@@ -164,13 +164,7 @@ impl Client {
         .await
     }
     pub async fn push(&self, torques: Push) -> Result<State> {
-        if !torques
-            .left
-            .iter()
-            .chain(torques.right.iter())
-            .flatten()
-            .all(|v| v.is_finite())
-        {
+        if !torques.values().all(|v| v.is_finite()) {
             return Err(Error::InvalidRequest(
                 "applied torques must be finite".into(),
             ));

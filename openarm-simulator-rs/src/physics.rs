@@ -1,69 +1,12 @@
-//! OpenArm plant configuration and motor dynamics on top of the MuJoCo wrapper.
-use crate::friction;
+//! Mechanical scene integration and configured actuator bindings.
+use crate::{config::Config, friction};
 use anyhow::{Context, Result, ensure};
 use damiao_simulator_rs::{Drive, ShaftState};
-use mujoco_rs::{Data, JOINT_HINGE, JOINT_SLIDE, Model, NBIAS, NIMP, NREF, Object, Spec};
+use mujoco_rs::{Data, JOINT_HINGE, JOINT_SLIDE, Model, NBIAS, NIMP, NREF, Object};
 use openarm_simulator_core_rs::{
-    ArmOptions as Arms, Arms as ArmValues, BodyParameters, JointParameters, PhysicsConfiguration,
-    Plant, Pose, Stribeck,
+    BodyParameters, JointParameters, PhysicsConfiguration, Plant, Push, Stribeck,
 };
-use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path, time::Duration};
-
-pub const SIDES: [&str; 2] = ["right", "left"];
-pub const DEFAULT_TIMESTEP_NS: u64 = 500_000;
-#[cfg(test)]
-const STEP: f64 = DEFAULT_TIMESTEP_NS as f64 / 1_000_000_000.;
-// Motor-to-finger conversion from enactic/openarm_ros2@4e837e1d0dae69,
-// openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp:
-// GRIPPER_JOINT_0_POSITION / -GRIPPER_MOTOR_1_RADIANS. Preserve its rounding.
-#[allow(clippy::approx_constant)]
-pub const RADIUS: f64 = 0.044 / 1.0472;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    #[serde(default = "crate::motor::v1_buses")]
-    pub buses: BTreeMap<String, String>,
-    #[serde(default = "crate::motor::v1_bindings")]
-    pub motors: BTreeMap<String, crate::motor::MotorBinding>,
-    /// Fixed integration interval; the scheduler and API use integer nanoseconds.
-    #[serde(default = "default_timestep")]
-    pub timestep_ns: u64,
-    #[serde(default)]
-    pub poses: Arms<Pose>,
-    #[serde(default)]
-    pub offsets: Arms<Pose>,
-    #[serde(default)]
-    pub bodies: BTreeMap<String, BodyParameters>,
-    #[serde(default)]
-    pub joints: BTreeMap<String, JointParameters>,
-    #[serde(default = "one")]
-    pub friction_scale: f64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            buses: crate::motor::v1_buses(),
-            motors: crate::motor::v1_bindings(),
-            timestep_ns: DEFAULT_TIMESTEP_NS,
-            poses: Arms::default(),
-            offsets: Arms::default(),
-            bodies: BTreeMap::new(),
-            joints: BTreeMap::new(),
-            friction_scale: 1.,
-        }
-    }
-}
-
-fn default_timestep() -> u64 {
-    DEFAULT_TIMESTEP_NS
-}
-
-fn one() -> f64 {
-    1.
-}
 
 struct VariableFriction {
     qpos: usize,
@@ -72,367 +15,290 @@ struct VariableFriction {
     law: Stribeck,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Index {
-    qpos: [usize; 9],
-    dof: [usize; 9],
-    actuator: [usize; 8],
-    ctrl: [usize; 8],
-    force: [usize; 8],
+struct Actuator {
+    name: String,
+    id: usize,
+    ctrl: usize,
+    force: usize,
+    offset: f64,
 }
 
 pub struct Physics {
     model: Model,
     data: Data,
-    index: [Index; 2],
-    offsets: [Pose; 2],
-    initial_poses: [Pose; 2],
+    actuators: Vec<Actuator>,
+    initial_positions: Vec<(usize, f64)>,
     pub timestep_ns: u64,
     friction: Vec<VariableFriction>,
     joint_parameters: BTreeMap<String, JointParameters>,
-    applied_torque: [[f64; 7]; 2],
+    applied_torque: Push,
+}
+
+fn scalar_joint(model: &Model, name: &str) -> Result<(usize, usize, usize)> {
+    let id = model.id(Object::Joint, name)?;
+    let m = model.view();
+    ensure!(
+        matches!(m.jnt_type[id], JOINT_HINGE | JOINT_SLIDE),
+        "expected a hinge or slide joint: {name}"
+    );
+    Ok((id, m.jnt_qposadr[id] as usize, m.jnt_dofadr[id] as usize))
 }
 
 impl Physics {
-    pub fn load(path: &Path, config: Config) -> Result<Self> {
+    pub fn load(path: &Path, config: &Config) -> Result<Self> {
         ensure!(config.timestep_ns > 0, "timestep_ns must be positive");
-        let mut spec = Spec::from_xml(path)?;
-        for side in SIDES {
-            spec.exclude_contact(
-                &format!("openarm_{side}_right_finger"),
-                &format!("openarm_{side}_left_finger"),
-            )?;
-            let force_range = spec.actuator_force_range(&format!("{side}_joint7_ctrl"))?;
-            spec.set_actuator_tendon(
-                &format!("{side}_finger1_ctrl"),
-                &format!("split_{side}"),
-                -1. / RADIUS,
-                force_range,
-            )?;
-            spec.remove_actuator(&format!("{side}_finger2_ctrl"))?;
-        }
-        let mut model = spec.compile()?;
+        let mut model = Model::from_xml(path)?;
         model.set_timestep(Duration::from_nanos(config.timestep_ns))?;
-        model.use_implicit_fast();
-        model.use_affine_actuators();
+        let mut actuators = Vec::new();
+        for binding in config.motors.values() {
+            ensure!(
+                binding.encoder_offset_rad.is_finite(),
+                "encoder offset must be finite"
+            );
+            let id = model.id(Object::Actuator, &binding.actuator)?;
+            model.use_affine_actuator(id)?;
+            let m = model.view();
+            actuators.push(Actuator {
+                name: binding.actuator.clone(),
+                id,
+                ctrl: m.actuator_ctrladr[id] as usize,
+                force: m.actuator_outadr[id] as usize,
+                offset: binding.encoder_offset_rad,
+            });
+        }
+        for (name, body) in &config.bodies {
+            let id = model.id(Object::Body, name)?;
+            ensure!(id > 0, "cannot change world body inertia");
+            ensure!(
+                body.mass.is_finite()
+                    && body.mass > 0.
+                    && body.com.iter().all(|x| x.is_finite())
+                    && body.inertia.iter().all(|x| x.is_finite() && *x > 0.),
+                "invalid inertial parameters for {name}"
+            );
+            let sum: f64 = body.inertia.iter().sum();
+            ensure!(
+                body.inertia.iter().all(|x| 2. * x <= sum + 1e-12),
+                "inertia triangle inequality for {name}"
+            );
+            let m = model.view_mut();
+            m.body_mass[id] = body.mass;
+            m.body_ipos[3 * id..3 * id + 3].copy_from_slice(&body.com);
+            m.body_inertia[3 * id..3 * id + 3].copy_from_slice(&body.inertia);
+        }
+        ensure!(
+            config.friction_scale.is_finite() && config.friction_scale >= 0.,
+            "invalid friction scale"
+        );
         {
             let m = model.view_mut();
-            m.jnt_solref
-                .chunks_mut(NREF)
-                .for_each(|a| a.copy_from_slice(&[0.002, 1.]));
-            m.jnt_solimp
-                .chunks_mut(NIMP)
-                .for_each(|a| a[..3].copy_from_slice(&[0.99, 0.999, 0.001]));
+            for (id, kind) in m.jnt_type.iter().enumerate() {
+                if *kind == JOINT_HINGE {
+                    let dof = m.jnt_dofadr[id] as usize;
+                    m.dof_frictionloss[dof] *= config.friction_scale;
+                    m.dof_damping[dof] *= config.friction_scale;
+                }
+            }
         }
-        let mut index = [Index::default(); 2];
-        {
-            let m = model.view();
-            for (side, name) in SIDES.iter().enumerate() {
-                for joint in 0..9 {
-                    let label = if joint < 7 {
-                        format!("openarm_{name}_joint{}", joint + 1)
-                    } else {
-                        format!("openarm_{name}_finger_joint{}", joint - 6)
-                    };
-                    let j = model.id(Object::Joint, &label)?;
+        for (name, parameters) in &config.joints {
+            let (id, qpos, dof) = scalar_joint(&model, name)?;
+            let m = model.view_mut();
+            ensure!(
+                parameters.stribeck.is_none() || m.jnt_type[id] == JOINT_HINGE,
+                "Stribeck friction requires a hinge joint: {name}"
+            );
+            for (value, field, address) in [
+                (
+                    parameters.frictionloss,
+                    "frictionloss",
+                    &mut m.dof_frictionloss[dof],
+                ),
+                (parameters.damping, "damping", &mut m.dof_damping[dof]),
+                (parameters.stiffness, "stiffness", &mut m.jnt_stiffness[id]),
+            ] {
+                if let Some(value) = value {
                     ensure!(
-                        matches!(m.jnt_type[j], JOINT_HINGE | JOINT_SLIDE),
-                        "motor joint must have one scalar degree of freedom"
+                        value.is_finite() && value >= 0.,
+                        "invalid {field} for {name}"
                     );
-                    index[side].qpos[joint] = m.jnt_qposadr[j] as usize;
-                    index[side].dof[joint] = m.jnt_dofadr[j] as usize;
-                    ensure!(
-                        index[side].qpos[joint] < m.nq && index[side].dof[joint] < m.nv,
-                        "invalid joint address"
-                    );
+                    *address = value;
                 }
-                for joint in 0..8 {
-                    let label = if joint < 7 {
-                        format!("{name}_joint{}_ctrl", joint + 1)
-                    } else {
-                        format!("{name}_finger1_ctrl")
-                    };
-                    let a = model.id(Object::Actuator, &label)?;
-                    ensure!(
-                        m.actuator_ctrlnum[a] == 1 && m.actuator_outnum[a] == 1,
-                        "MIT requires scalar actuator control/force"
-                    );
-                    index[side].actuator[joint] = a;
-                    index[side].ctrl[joint] = m.actuator_ctrladr[a] as usize;
-                    index[side].force[joint] = m.actuator_outadr[a] as usize;
-                    ensure!(
-                        index[side].ctrl[joint] < m.nu && index[side].force[joint] < m.nout,
-                        "invalid actuator control/output address"
-                    );
-                }
+            }
+            if let Some(value) = parameters.springref {
+                ensure!(value.is_finite(), "invalid springref for {name}");
+                m.qpos_spring[qpos] = value;
             }
         }
         let mut friction = Vec::new();
         let mut joint_parameters = BTreeMap::new();
-        // Experimental assembly changes live only in this simulator's model.
-        // Never edit the upstream XML or the estimator's nominal description.
-        {
-            ensure!(
-                config.friction_scale.is_finite() && config.friction_scale >= 0.,
-                "invalid friction scale"
-            );
-            for (name, body) in &config.bodies {
-                let id = model.id(Object::Body, name)?;
-                let m = model.view_mut();
-                ensure!(
-                    id > 0
-                        && (name.starts_with("openarm_right_")
-                            || name.starts_with("openarm_left_")),
-                    "invalid perturbed arm body {name}"
-                );
-                ensure!(
-                    body.mass.is_finite()
-                        && body.mass > 0.
-                        && body.com.iter().all(|x| x.is_finite())
-                        && body.inertia.iter().all(|x| x.is_finite() && *x > 0.),
-                    "invalid inertial parameters for {name}"
-                );
-                let sum: f64 = body.inertia.iter().sum();
-                ensure!(
-                    body.inertia.iter().all(|x| 2. * x <= sum + 1e-12),
-                    "inertia triangle inequality for {name}"
-                );
-                m.body_mass[id] = body.mass;
-                m.body_ipos[3 * id..3 * id + 3].copy_from_slice(&body.com);
-                m.body_inertia[3 * id..3 * id + 3].copy_from_slice(&body.inertia);
+        for id in 0..model.view().jnt_type.len() {
+            if !matches!(model.view().jnt_type[id], JOINT_HINGE | JOINT_SLIDE) {
+                continue;
             }
+            let Some(name) = model.name(Object::Joint, id).map(str::to_owned) else {
+                continue;
+            };
+            let (_, qpos, dof) = scalar_joint(&model, &name)?;
             let m = model.view_mut();
-            for ix in &index {
-                for dof in &ix.dof[..7] {
-                    m.dof_frictionloss[*dof] *= config.friction_scale;
-                    m.dof_damping[*dof] *= config.friction_scale;
-                }
+            let sliding_nm = m.dof_frictionloss[dof];
+            let damping = m.dof_damping[dof];
+            ensure!(
+                sliding_nm.is_finite() && damping.is_finite(),
+                "friction scaling overflow for {name}"
+            );
+            let law = config.joints.get(&name).and_then(|p| p.stribeck.clone());
+            if let Some(law) = &law {
+                friction::validate(law, sliding_nm)
+                    .with_context(|| format!("invalid friction for {name}"))?;
+                m.dof_solref[dof * NREF..dof * NREF + NREF].copy_from_slice(&[0.002, 1.]);
+                m.dof_solimp[dof * NIMP..dof * NIMP + NIMP]
+                    .copy_from_slice(&[0.999, 0.999, 0.001, 0.5, 2.]);
+                friction.push(VariableFriction {
+                    qpos,
+                    dof,
+                    sliding_nm,
+                    law: law.clone(),
+                });
             }
-            for (name, parameters) in &config.joints {
-                let id = model.id(Object::Joint, name)?;
-                let m = model.view_mut();
-                let joint = id;
-                let dof = m.jnt_dofadr[joint] as usize;
-                let qpos = m.jnt_qposadr[joint] as usize;
-                ensure!(
-                    m.jnt_type[joint] == JOINT_HINGE
-                        && index.iter().any(|ix| ix.dof[..7].contains(&dof)),
-                    "only arm hinge joints can be perturbed: {name}"
-                );
-                for (value, field, address) in [
-                    (
-                        parameters.frictionloss,
-                        "frictionloss",
-                        &mut m.dof_frictionloss[dof],
-                    ),
-                    (parameters.damping, "damping", &mut m.dof_damping[dof]),
-                    (
-                        parameters.stiffness,
-                        "stiffness",
-                        &mut m.jnt_stiffness[joint],
-                    ),
-                ] {
-                    if let Some(value) = value {
-                        ensure!(
-                            value.is_finite() && value >= 0.,
-                            "invalid {field} for {name}"
-                        );
-                        *address = value;
-                    }
-                }
-                if let Some(value) = parameters.springref {
-                    ensure!(value.is_finite(), "invalid springref for {name}");
-                    m.qpos_spring[qpos] = value;
-                }
-            }
-            for (side, ix) in index.iter().enumerate() {
-                for j in 0..7 {
-                    let name = format!("openarm_{}_joint{}", SIDES[side], j + 1);
-                    let id = model.id(Object::Joint, &name)?;
-                    let m = model.view_mut();
-                    let sliding_nm = m.dof_frictionloss[ix.dof[j]];
-                    let damping = m.dof_damping[ix.dof[j]];
-                    ensure!(
-                        sliding_nm.is_finite() && damping.is_finite(),
-                        "friction scaling overflow for {name}"
-                    );
-                    let law = config.joints.get(&name).and_then(|p| p.stribeck.clone());
-                    if let Some(law) = &law {
-                        friction::validate(law, sliding_nm)
-                            .with_context(|| format!("invalid friction for {name}"))?;
-                        // Default soft friction can creep across the Stribeck
-                        // band under a sub-breakaway load on small wrist inertia.
-                        // Enhanced joints use a firmer, still regularized native
-                        // constraint. Basic joints keep their upstream settings.
-                        m.dof_solref[ix.dof[j] * NREF..ix.dof[j] * NREF + NREF]
-                            .copy_from_slice(&[0.002, 1.]);
-                        m.dof_solimp[ix.dof[j] * NIMP..ix.dof[j] * NIMP + NIMP]
-                            .copy_from_slice(&[0.999, 0.999, 0.001, 0.5, 2.]);
-                        friction.push(VariableFriction {
-                            qpos: ix.qpos[j],
-                            dof: ix.dof[j],
-                            sliding_nm,
-                            law: law.clone(),
-                        });
-                    }
-                    joint_parameters.insert(
-                        name,
-                        JointParameters {
-                            frictionloss: Some(sliding_nm),
-                            damping: Some(damping),
-                            stiffness: Some(m.jnt_stiffness[id]),
-                            springref: Some(m.qpos_spring[ix.qpos[j]]),
-                            stribeck: law,
-                        },
-                    );
-                }
-            }
+            joint_parameters.insert(
+                name,
+                JointParameters {
+                    frictionloss: Some(sliding_nm),
+                    damping: Some(damping),
+                    stiffness: Some(m.jnt_stiffness[id]),
+                    springref: Some(m.qpos_spring[qpos]),
+                    stribeck: law,
+                },
+            );
+        }
+        let mut initial_positions = Vec::new();
+        for (name, value) in &config.positions {
+            ensure!(value.is_finite(), "startup position must be finite: {name}");
+            let (_, qpos, _) = scalar_joint(&model, name)?;
+            initial_positions.push((qpos, *value));
         }
         let mut data = Data::new(&model)?;
         model.set_constants(&mut data);
-        let offsets = [config.offsets.right, config.offsets.left].map(|a| a.unwrap_or([0.; 8]));
-        let mut zero = [0.; 8];
-        zero[7] = -10f64.to_radians();
-        let initial_poses = [config.poses.right, config.poses.left].map(|a| a.unwrap_or(zero));
-        let mut world = Self {
+        let mut physics = Self {
             model,
             data,
-            index,
-            offsets,
-            initial_poses,
+            actuators,
+            initial_positions,
             timestep_ns: config.timestep_ns,
             friction,
             joint_parameters,
-            applied_torque: [[0.; 7]; 2],
+            applied_torque: Push::new(),
         };
-        world.reset()?;
-        Ok(world)
-    }
-
-    pub fn port(&self, actuator: &str) -> Result<(usize, usize)> {
-        let id = self.model.id(Object::Actuator, actuator)?;
-        self.index
-            .iter()
-            .enumerate()
-            .find_map(|(side, ix)| {
-                ix.actuator
-                    .iter()
-                    .position(|a| *a == id)
-                    .map(|joint| (side, joint))
-            })
-            .context("actuator is not supported by the OpenArm scene adapter")
+        physics.reset()?;
+        Ok(physics)
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        let poses = self.initial_poses;
-        ensure!(
-            poses
-                .iter()
-                .chain(&self.offsets)
-                .flatten()
-                .all(|v| v.is_finite()),
-            "poses/offsets must be finite"
-        );
         self.model.reset_data(&mut self.data);
-        {
-            let d = self.data.view_mut();
-            for (side, pose) in poses.iter().enumerate() {
-                for (j, q) in pose[..7].iter().enumerate() {
-                    d.qpos[self.index[side].qpos[j]] = *q;
-                }
-                for j in 7..9 {
-                    d.qpos[self.index[side].qpos[j]] = -pose[7] * RADIUS;
-                }
-            }
+        for (qpos, position) in &self.initial_positions {
+            self.data.view_mut().qpos[*qpos] = *position;
         }
-        self.applied_torque = [[0.; 7]; 2];
-        self.configure(&[[Drive::default(); 8]; 2]);
+        self.applied_torque.clear();
+        self.configure(&vec![Drive::default(); self.actuators.len()])?;
         self.configure_friction();
         self.model.forward(&mut self.data);
+        self.validate_state()
+    }
+
+    fn configure(&mut self, drives: &[Drive]) -> Result<()> {
+        ensure!(
+            drives.len() == self.actuators.len(),
+            "actuator drive count mismatch"
+        );
+        let (m, d) = (self.model.view_mut(), self.data.view_mut());
+        for (a, drive) in self.actuators.iter().zip(drives) {
+            let control = drive.feedforward - drive.stiffness * a.offset;
+            ensure!(
+                [control, drive.stiffness, drive.damping]
+                    .iter()
+                    .all(|v| v.is_finite()),
+                "nonfinite actuator drive"
+            );
+            d.ctrl[a.ctrl] = control;
+            m.actuator_biasprm[a.id * NBIAS + 1] = -drive.stiffness;
+            m.actuator_biasprm[a.id * NBIAS + 2] = -drive.damping;
+        }
         Ok(())
     }
 
-    fn configure(&mut self, drives: &[[Drive; 8]; 2]) {
-        let (m, d) = (self.model.view_mut(), self.data.view_mut());
-        for (side, motors) in drives.iter().enumerate() {
-            for (j, drive) in motors.iter().enumerate() {
-                let a = self.index[side].actuator[j];
-                d.ctrl[self.index[side].ctrl[j]] =
-                    drive.feedforward - drive.stiffness * self.offsets[side][j];
-                m.actuator_biasprm[a * NBIAS + 1] = -drive.stiffness;
-                m.actuator_biasprm[a * NBIAS + 2] = -drive.damping;
-            }
-        }
-    }
-
     fn configure_friction(&mut self) {
-        // Freeze a positive friction bound over this implicit step. MuJoCo's
-        // native constraint chooses the opposing force and handles stiction;
-        // no explicit sign(v) torque, hidden integrator or bristle state is added.
-        {
-            let (m, d) = (self.model.view_mut(), self.data.view_mut());
-            for joint in &self.friction {
-                m.dof_frictionloss[joint.dof] = friction::bound_nm(
-                    &joint.law,
-                    joint.sliding_nm,
-                    d.qpos[joint.qpos],
-                    d.qvel[joint.dof],
-                );
-            }
+        let (m, d) = (self.model.view_mut(), self.data.view_mut());
+        for joint in &self.friction {
+            m.dof_frictionloss[joint.dof] = friction::bound_nm(
+                &joint.law,
+                joint.sliding_nm,
+                d.qpos[joint.qpos],
+                d.qvel[joint.dof],
+            );
         }
     }
 
-    pub fn step(&mut self, count: u64, drives: &[[Drive; 8]; 2]) -> Result<()> {
-        self.configure(drives);
+    pub fn step(&mut self, count: u64, drives: &[Drive]) -> Result<()> {
+        self.configure(drives)?;
         for _ in 0..count {
             self.configure_friction();
             self.model.step(&mut self.data);
         }
+        self.validate_state()?;
+        self.model.forward(&mut self.data);
+        self.validate_state()
+    }
+
+    fn validate_state(&self) -> Result<()> {
+        let d = self.data.view();
         ensure!(
             self.data.warnings().iter().all(|w| w.number == 0)
-                && self.data.view().qpos.iter().all(|q| q.is_finite()),
+                && [
+                    d.qpos,
+                    d.qvel,
+                    d.actuator_length,
+                    d.actuator_velocity,
+                    d.actuator_force
+                ]
+                .into_iter()
+                .flatten()
+                .all(|v| v.is_finite()),
             "MuJoCo numerical warning; simulation stopped"
         );
         Ok(())
     }
 
-    pub fn observations(&self) -> [[ShaftState; 8]; 2] {
+    pub fn observations(&self) -> Vec<ShaftState> {
         let d = self.data.view();
-        std::array::from_fn(|side| {
-            std::array::from_fn(|j| {
-                let ix = self.index[side];
-                let (position, velocity) = if j < 7 {
-                    (d.qpos[ix.qpos[j]], d.qvel[ix.dof[j]])
-                } else {
-                    (
-                        -(d.qpos[ix.qpos[7]] + d.qpos[ix.qpos[8]]) / (2. * RADIUS),
-                        -(d.qvel[ix.dof[7]] + d.qvel[ix.dof[8]]) / (2. * RADIUS),
-                    )
-                };
-                ShaftState {
-                    position: position + self.offsets[side][j],
-                    velocity,
-                    torque: d.actuator_force[ix.force[j]],
-                }
+        self.actuators
+            .iter()
+            .map(|a| ShaftState {
+                position: d.actuator_length[a.force] + a.offset,
+                velocity: d.actuator_velocity[a.force],
+                torque: d.actuator_force[a.force],
             })
-        })
+            .collect()
     }
+
     pub fn version() -> String {
         mujoco_rs::version()
     }
 
-    pub fn push(&mut self, forces: [[f64; 7]; 2]) -> Result<()> {
-        ensure!(
-            forces.iter().flatten().all(|v| v.is_finite()),
-            "invalid applied torque"
-        );
-        {
-            let d = self.data.view_mut();
-            for (side, arm) in forces.iter().enumerate() {
-                for (j, force) in arm.iter().enumerate() {
-                    d.qfrc_applied[self.index[side].dof[j]] = *force;
-                }
-            }
+    pub fn push(&mut self, forces: Push) -> Result<()> {
+        let mut resolved = Vec::new();
+        for (name, force) in &forces {
+            ensure!(force.is_finite(), "invalid applied torque");
+            let (id, _, dof) = scalar_joint(&self.model, name)?;
+            ensure!(
+                self.model.view().jnt_type[id] == JOINT_HINGE,
+                "joint torque requires a hinge: {name}"
+            );
+            resolved.push((dof, *force));
+        }
+        let d = self.data.view_mut();
+        d.qfrc_applied.fill(0.);
+        for (dof, force) in resolved {
+            d.qfrc_applied[dof] = force;
         }
         self.applied_torque = forces;
         Ok(())
@@ -442,10 +308,7 @@ impl Physics {
         Plant {
             friction_model: "mujoco-dry-viscous-with-optional-stribeck-v1".into(),
             joints: self.joint_parameters.clone(),
-            applied_torque_nm: ArmValues {
-                right: self.applied_torque[0],
-                left: self.applied_torque[1],
-            },
+            applied_torque_nm: self.applied_torque.clone(),
         }
     }
 
@@ -454,56 +317,136 @@ impl Physics {
             friction_model: "mujoco-dry-viscous-with-optional-stribeck-v1".into(),
             mujoco_version: Self::version(),
             timestep_ns: self.timestep_ns,
-            integrator: "implicitfast".into(),
+            integrator: self.model.integrator().into(),
             gravity_m_s2: self.model.gravity(),
-            joint_stop_solref: [0.002, 1.],
-            joint_stop_solimp: [0.99, 0.999, 0.001, 0.5, 2.],
             enhanced_friction_solref: [0.002, 1.],
             enhanced_friction_solimp: [0.999, 0.999, 0.001, 0.5, 2.],
-            gripper_radius_m: RADIUS,
             joints: self.joint_parameters.clone(),
             bodies: self.body_parameters(),
-            encoder_offsets_rad: ArmValues {
-                right: self.offsets[0],
-                left: self.offsets[1],
-            },
+            encoder_offsets_rad: self
+                .actuators
+                .iter()
+                .map(|a| (a.name.clone(), a.offset))
+                .collect(),
         }
     }
 
     fn body_parameters(&self) -> BTreeMap<String, BodyParameters> {
-        let model = &self.model;
-        let m = model.view();
+        let m = self.model.view();
         (1..m.nbody)
-            .filter_map(|i| {
-                let name = model.name(Object::Body, i)?;
-                if !name.starts_with("openarm_right_") && !name.starts_with("openarm_left_") {
-                    return None;
-                }
-                Some((
-                    name.to_owned(),
-                    BodyParameters {
-                        mass: m.body_mass[i],
-                        com: m.body_ipos[3 * i..3 * i + 3].try_into().unwrap(),
-                        inertia: m.body_inertia[3 * i..3 * i + 3].try_into().unwrap(),
-                    },
-                ))
+            .filter_map(|id| {
+                self.model.name(Object::Body, id).map(|name| {
+                    (
+                        name.into(),
+                        BodyParameters {
+                            mass: m.body_mass[id],
+                            com: m.body_ipos[3 * id..3 * id + 3].try_into().unwrap(),
+                            inertia: m.body_inertia[3 * id..3 * id + 3].try_into().unwrap(),
+                        },
+                    )
+                })
             })
             .collect()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_TIMESTEP_NS;
+    const STEP: f64 = DEFAULT_TIMESTEP_NS as f64 / 1_000_000_000.;
+    #[allow(clippy::approx_constant)]
+    const RADIUS: f64 = 0.044 / 1.0472;
+    fn profile() -> Config {
+        serde_json::from_str(include_str!("../config/openarm-v1.json")).unwrap()
+    }
+    fn positions(right: [f64; 8], left: [f64; 8]) -> BTreeMap<String, f64> {
+        let mut positions = BTreeMap::new();
+        for (side, pose) in [("right", right), ("left", left)] {
+            for (j, q) in pose[..7].iter().enumerate() {
+                positions.insert(format!("openarm_{side}_joint{}", j + 1), *q);
+            }
+            for j in 1..=2 {
+                positions.insert(format!("openarm_{side}_finger_joint{j}"), -pose[7] * RADIUS);
+            }
+        }
+        positions
+    }
+    fn torques(values: [[f64; 7]; 2]) -> Push {
+        ["right", "left"]
+            .into_iter()
+            .zip(values)
+            .flat_map(|(side, values)| {
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(j, value)| (format!("openarm_{side}_joint{}", j + 1), value))
+            })
+            .collect()
+    }
+
     use crate::simulation::Simulation;
     use damiao_can_rs::{MitCommand, MotorStatus};
+    #[test]
+    fn arbitrary_scene_names_gearing_and_unmapped_actuators() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scene.xml");
+        std::fs::write(&path, r#"<mujoco>
+          <option gravity="0 0 0" integrator="implicitfast"/>
+          <worldbody>
+            <body name="tool"><joint name="hinge" damping="0.2"/><geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="1"/></body>
+            <body name="extra" pos="2 0 0"><joint name="passive"/><geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="1"/></body>
+            <body pos="4 0 0"><freejoint name="floating"/><geom type="sphere" size="0.1" mass="1"/></body>
+          </worldbody>
+          <actuator>
+            <position name="untouched" joint="passive" kp="7" ctrlrange="-1 1"/>
+            <motor name="shaft" joint="hinge" gear="3" forcelimited="true" forcerange="-2 2"/>
+          </actuator>
+        </mujoco>"#).unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "buses":{"bench":"vcan9"},
+            "positions":{"hinge":0.2},
+            "bodies":{"tool":{"mass":2.,"com":[0.1,0.,0.],"inertia":[0.001,0.01,0.01]}},
+            "motors":{"tool_motor":{"bus":"bench","actuator":"shaft","encoder_offset_rad":0.4,
+                "controller":{"id":75,"reply_id":150,"ranges":{"pmax":12.5,"vmax":30.,"tmax":10.}}}}
+        }))
+        .unwrap();
+        let original = Model::from_xml(&path).unwrap();
+        let mut sim = Simulation::load(&path, config).unwrap();
+        let initial = sim.snapshot();
+        assert_eq!(sim.motors.len(), 1);
+        assert!((initial["tool_motor"].q - 1.).abs() < 1e-12);
+        assert_eq!(sim.physics.configuration().bodies["tool"].mass, 2.);
+        assert_eq!(
+            &sim.physics.model.view().actuator_biasprm[..NBIAS],
+            &original.view().actuator_biasprm[..NBIAS]
+        );
+        sim.physics.data.view_mut().ctrl[0] = 0.3;
+        sim.motors[0].status = MotorStatus::ENABLED;
+        sim.motors[0].command = MitCommand {
+            q: 1.6,
+            kp: 4.,
+            kd: 0.5,
+            ..MitCommand::default()
+        };
+        sim.step(200).unwrap();
+        assert!(sim.motors[0].q > 1.1);
+        assert!(sim.motors[0].torque.abs() <= 2.);
+        let (_, qpos, _) = scalar_joint(&sim.physics.model, "hinge").unwrap();
+        assert!((sim.motors[0].q - (3. * sim.physics.data.view().qpos[qpos] + 0.4)).abs() < 1e-12);
+        let (_, passive, _) = scalar_joint(&sim.physics.model, "passive").unwrap();
+        assert!(sim.physics.data.view().qpos[passive] > 0.);
+        assert_eq!(sim.physics.data.view().ctrl[0], 0.3);
+        sim.reset().unwrap();
+        assert_eq!(sim.snapshot(), initial);
+    }
+
     fn world(config: Config) -> Simulation {
         Simulation::load(std::path::Path::new(openarm_test_model::SCENE), config).unwrap()
     }
 
     #[test]
     fn nonfinite_state_is_rejected_until_reset() {
-        let mut p = world(Config::default());
+        let mut p = world(profile());
         p.physics.data.view_mut().qpos[0] = f64::NAN;
         assert_eq!(
             p.step(0).unwrap_err().to_string(),
@@ -519,11 +462,8 @@ mod tests {
         pose[3] = 45f64.to_radians();
         pose[7] = -0.2;
         let mut p = world(Config {
-            poses: Arms {
-                right: Some(pose),
-                left: Some(pose),
-            },
-            ..Config::default()
+            positions: positions(pose, pose),
+            ..profile()
         });
         p.step(200).unwrap();
         assert!((p.motors[11].q - pose[3]).abs() > 0.001);
@@ -544,7 +484,7 @@ mod tests {
 
     #[test]
     fn gripper_transmission_loaded_stop_and_no_teleport() {
-        let mut p = world(Config::default());
+        let mut p = world(profile());
         p.motors[15].status = MotorStatus::ENABLED;
         p.motors[15].command = MitCommand {
             kp: 10.,
@@ -557,8 +497,9 @@ mod tests {
         p.step(1000).unwrap();
         assert!((p.motors[15].q + 0.5).abs() < 0.01);
         {
-            for i in &p.physics.index[0].qpos[7..] {
-                assert!((p.physics.data.view().qpos[*i] - 0.5 * RADIUS).abs() < 0.001);
+            for name in ["openarm_right_finger_joint1", "openarm_right_finger_joint2"] {
+                let i = scalar_joint(&p.physics.model, name).unwrap().1;
+                assert!((p.physics.data.view().qpos[i] - 0.5 * RADIUS).abs() < 0.001);
             }
         }
         p.motors[15].command = MitCommand {
@@ -574,7 +515,7 @@ mod tests {
 
     #[test]
     fn joint_target_is_physics_driven_and_force_is_bounded() {
-        let mut p = world(Config::default());
+        let mut p = world(profile());
         p.motors[14].status = MotorStatus::ENABLED;
         p.motors[14].command = MitCommand {
             kp: 10.,
@@ -597,13 +538,13 @@ mod tests {
 
     #[test]
     fn encoder_bias_and_reset() {
-        let mut p = world(Config {
-            offsets: Arms {
-                right: Some([0.01; 8]),
-                left: None,
-            },
-            ..Config::default()
-        });
+        let mut config = profile();
+        for (name, motor) in &mut config.motors {
+            if name.starts_with("right_") {
+                motor.encoder_offset_rad = 0.01;
+            }
+        }
+        let mut p = world(config);
         assert_eq!(p.motors[14].q, 0.01);
         p.motors[14].status = MotorStatus::ENABLED;
         p.motors[14].command = MitCommand {
@@ -635,26 +576,32 @@ mod tests {
         let mut p = world(Config {
             friction_scale: 0.5,
             joints: BTreeMap::from([("openarm_right_joint4".into(), parameters)]),
-            ..Config::default()
+            ..profile()
         });
         p.reset().unwrap();
         {
             let (m, d) = (p.physics.model.view(), p.physics.data.view());
-            let dof = p.physics.index[0].dof[3];
+            let dof = scalar_joint(&p.physics.model, "openarm_right_joint4")
+                .unwrap()
+                .2;
             assert_eq!(m.dof_frictionloss[dof], 0.23);
             assert_eq!(m.dof_damping[dof], 0.61);
             assert!((d.qfrc_passive[dof] - 0.47 * 0.19).abs() < 1e-12);
-            assert!((m.dof_frictionloss[p.physics.index[1].dof[3]] - 0.05).abs() < 1e-12);
+            assert!(
+                (m.dof_frictionloss[scalar_joint(&p.physics.model, "openarm_left_joint4")
+                    .unwrap()
+                    .2]
+                    - 0.05)
+                    .abs()
+                    < 1e-12
+            );
         }
     }
 
     #[test]
     fn reject_invalid_joint_parameters() {
         let path = std::path::Path::new(openarm_test_model::SCENE);
-        for (name, value) in [
-            ("openarm_right_joint4", -0.1),
-            ("openarm_right_finger_joint1", 0.1),
-        ] {
+        for (name, value) in [("openarm_right_joint4", -0.1), ("missing_joint", 0.1)] {
             let config = Config {
                 joints: BTreeMap::from([(
                     name.into(),
@@ -663,7 +610,7 @@ mod tests {
                         ..JointParameters::default()
                     },
                 )]),
-                ..Config::default()
+                ..profile()
             };
             assert!(Simulation::load(path, config).is_err());
         }
@@ -681,7 +628,7 @@ mod tests {
                     ..JointParameters::default()
                 },
             )]),
-            ..Config::default()
+            ..profile()
         });
         // Isolate passive dissipation from gravity, contacts and joint stops.
         // This remains the full coupled robot mass matrix, not a signal delay.
@@ -718,7 +665,9 @@ mod tests {
                 ..test_law()
             };
             let mut p = friction_world(Some(law), STEP);
-            let dof = p.physics.index[0].dof[6];
+            let dof = scalar_joint(&p.physics.model, "openarm_right_joint7")
+                .unwrap()
+                .2;
             {
                 p.physics.data.view_mut().qvel[dof] = sign * 2.;
                 p.physics.model.forward(&mut p.physics.data);
@@ -755,7 +704,7 @@ mod tests {
         let mut force = [[0.; 7]; 2];
         force[0][6] = 0.3; // Above sliding friction, below enhanced breakaway.
         for p in [&mut basic, &mut rich, &mut repeated] {
-            p.push(force).unwrap();
+            p.push(torques(force)).unwrap();
         }
         basic.step(400).unwrap();
         rich.step(400).unwrap();
@@ -772,7 +721,7 @@ mod tests {
         assert_eq!(rich.motors[14].dq, repeated.motors[14].dq);
         assert_eq!(rich.motors[14].torque, 0.); // External push is not motor torque.
         force[0][6] = 0.9;
-        rich.push(force).unwrap();
+        rich.push(torques(force)).unwrap();
         let before = rich.motors[14].q;
         rich.step(200).unwrap();
         assert!(rich.motors[14].q - before > 0.01);
@@ -797,7 +746,7 @@ mod tests {
             for torque in [0.2, 0.9, 0., -0.9, 0.] {
                 let mut force = [[0.; 7]; 2];
                 force[0][6] = torque;
-                p.push(force).unwrap();
+                p.push(torques(force)).unwrap();
                 p.step((0.1 / step).round() as u64).unwrap();
             }
             endpoints.push(p.motors[14].q);
@@ -818,22 +767,32 @@ mod tests {
         let mut p = friction_world(Some(test_law()), STEP);
         let mut force = [[0.; 7]; 2];
         force[0][6] = 0.75;
-        p.push(force).unwrap();
+        p.push(torques(force)).unwrap();
         let previous = p.physics.parameters();
         force[1][0] = f64::NAN;
-        assert!(p.push(force).is_err());
+        assert!(p.push(torques(force)).is_err());
         assert_eq!(p.physics.parameters(), previous);
         p.step(100).unwrap();
         p.reset().unwrap();
-        assert_eq!(p.physics.applied_torque, [[0.; 7]; 2]);
+        assert!(p.physics.applied_torque.is_empty());
         assert_eq!(p.physics.parameters().joints, previous.joints);
         {
             assert_eq!(
-                p.physics.data.view().qfrc_applied[p.physics.index[0].dof[6]],
+                p.physics.data.view().qfrc_applied[scalar_joint(
+                    &p.physics.model,
+                    "openarm_right_joint7"
+                )
+                .unwrap()
+                .2],
                 0.
             );
             assert_eq!(
-                p.physics.model.view().dof_frictionloss[p.physics.index[0].dof[6]],
+                p.physics.model.view().dof_frictionloss[scalar_joint(
+                    &p.physics.model,
+                    "openarm_right_joint7"
+                )
+                .unwrap()
+                .2],
                 0.6
             );
         }
@@ -844,11 +803,8 @@ mod tests {
         let right = [-26.625f64, 1.814, -56.701, 121.279, 0., 0., 0., -10.].map(f64::to_radians);
         let left = [-69.152f64, -4.847, -72.3, 115.939, 0., 0., 0., -10.].map(f64::to_radians);
         let p = world(Config {
-            poses: Arms {
-                right: Some(right),
-                left: Some(left),
-            },
-            ..Config::default()
+            positions: positions(right, left),
+            ..profile()
         });
         let hit = p.physics.data.contacts().iter().any(|c| {
             let a = p
