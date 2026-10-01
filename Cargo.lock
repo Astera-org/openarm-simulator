@@ -225,6 +225,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "damiao-simulator-rs"
+version = "0.1.0"
+dependencies = [
+ "damiao-can-rs",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -618,6 +627,7 @@ dependencies = [
  "anyhow",
  "clap",
  "damiao-can-rs",
+ "damiao-simulator-rs",
  "http-body-util",
  "hyper",
  "hyper-util",

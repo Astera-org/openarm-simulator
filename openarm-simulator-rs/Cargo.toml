@@ -6,6 +6,7 @@ rust-version = "1.89"
 publish = false
 
 [dependencies]
+damiao-simulator-rs = { path = "../damiao-simulator-rs" }
 openarm-simulator-core-rs = { path = "../openarm-simulator-core-rs" }
 mujoco-rs = { path = "../mujoco-rs" }
 damiao-can-rs = { path = "../damiao-can-rs" }

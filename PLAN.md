@@ -13,7 +13,7 @@ FOR CHOSEN OPTION.
 
 - [x] 1. Rename `openarm-can-rs` to `damiao-can-rs`. Update consumers without
   changing packet behavior or existing tests.
-- [ ] 2. Extract `damiao-simulator-rs`. Declare `MotorConfig` for implemented
+- [x] 2. Extract `damiao-simulator-rs`. Declare `MotorConfig` for implemented
   controller settings; remove OpenArm joint-number construction and dependencies
   on administration models. Move OpenArm presets into the application. Controller
   unit tests must run without MuJoCo, model downloads, or sockets.
@@ -32,10 +32,6 @@ FOR CHOSEN OPTION.
   the supplied model. Only mapped actuators are adapted for motor emulation.
   Test a small scene with different names and motor count, retaining OpenArm
   physical regression coverage.
-- [ ] 6. Support operation without MuJoCo. Supply mechanical observations
-  directly in motor-only tests while reusing controllers, sockets, clock, and
-  administration. Protocol/socket tests should not need native physics or robot
-  assets; physical integration tests retain MuJoCo.
 
 ## Boundaries
 
@@ -59,10 +55,15 @@ paused. Normal motor commands continue to use CAN.
 
 Run the relevant package tests after each phase, then the workspace and client
 checks after the completed integration. Keep codec tests as unit tests. Verify
-controller tests and a motor-only executable build without MuJoCo/model downloads.
+controller unit tests build without MuJoCo/model downloads.
 Use virtual CAN only for socket integration tests.
 
 ## Deferred
+
+Motor-only executable operation and moving socket tests off MuJoCo are not a
+priority and are excluded from this implementation. Preserve the ability to use
+the motor library independently through its dependency boundary and mechanical
+interface; do not add a standalone mode or backend framework for that purpose.
 
 Generic scene inspection, pose editing, disturbances, additional motor protocols,
 dynamic plugins, and a general physics-plugin framework are separate work.

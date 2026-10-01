@@ -1,8 +1,8 @@
 //! OpenArm plant configuration and motor dynamics on top of the MuJoCo wrapper.
 use crate::{friction, motor::Motor};
 use anyhow::{Context, Result, ensure};
-use mujoco_rs::{Data, JOINT_HINGE, JOINT_SLIDE, Model, NBIAS, NIMP, NREF, Object, Spec};
 use damiao_can_rs::{MitCommand, MotorStatus};
+use mujoco_rs::{Data, JOINT_HINGE, JOINT_SLIDE, Model, NBIAS, NIMP, NREF, Object, Spec};
 use openarm_simulator_core_rs::{
     ArmOptions as Arms, ArmStates, Arms as ArmValues, BodyParameters, JointParameters,
     PhysicsConfiguration, Plant, Pose, Stribeck,
@@ -299,7 +299,7 @@ impl Physics {
             friction,
             joint_parameters,
             applied_torque: [[0.; 7]; 2],
-            motors: std::array::from_fn(|_| std::array::from_fn(|i| Motor::new(i + 1))),
+            motors: std::array::from_fn(|_| std::array::from_fn(|i| crate::motor::v1_motor(i + 1))),
         };
         world.reset()?;
         Ok(world)
@@ -325,7 +325,7 @@ impl Physics {
                 for j in 7..9 {
                     d.qpos[self.index[side].qpos[j]] = -pose[7] * RADIUS;
                 }
-                self.motors[side] = std::array::from_fn(|i| Motor::new(i + 1));
+                self.motors[side] = std::array::from_fn(|i| crate::motor::v1_motor(i + 1));
             }
         }
         self.applied_torque = [[0.; 7]; 2];
@@ -418,8 +418,8 @@ impl Physics {
 
     pub fn snapshot(&self) -> ArmStates {
         ArmValues {
-            right: self.motors[0].map(|m| m.snapshot()),
-            left: self.motors[1].map(|m| m.snapshot()),
+            right: self.motors[0].map(|m| crate::motor::snapshot(&m)),
+            left: self.motors[1].map(|m| crate::motor::snapshot(&m)),
         }
     }
     pub fn version() -> String {

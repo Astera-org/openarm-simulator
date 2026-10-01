@@ -955,9 +955,7 @@ fn can_client_codec_and_socket_errors() {
     if !in_can_namespace("can_client_codec_and_socket_errors") {
         return;
     }
-    use damiao_can_rs::{
-        ControlMode, DM4310_DEFAULT_MAPPING_RANGES, Feedback, MotorStatus, Request,
-    };
+    use damiao_can_rs::{ControlMode, Feedback, MappingRanges, MotorStatus, Request};
     let mut service =
         Running::start(command().args(["--model", openarm_test_model::SCENE, "--port", "0"]));
     let bus = client_bus("can1", 0x17);
@@ -965,7 +963,11 @@ fn can_client_codec_and_socket_errors() {
     bus.set_read_timeout(Duration::from_millis(10)).unwrap();
     let error = bus.read_frame().unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-    let limits = DM4310_DEFAULT_MAPPING_RANGES;
+    let limits = MappingRanges {
+        pmax: 12.5,
+        vmax: 30.,
+        tmax: 10.,
+    };
     let packet = Request::Enable(ControlMode::Mit).encode(7, limits).unwrap();
     let enable_frame =
         CanFdFrame::new(StandardId::new(packet.id as u16).unwrap(), packet.data()).unwrap();

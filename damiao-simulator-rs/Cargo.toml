@@ -1,0 +1,11 @@
+[package]
+name = "damiao-simulator-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+damiao-can-rs = { path = "../damiao-can-rs", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

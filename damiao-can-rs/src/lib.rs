@@ -32,23 +32,6 @@ const MIT_FIELD_BITS: u32 = 12;
 pub const MIT_KP_MAX: f64 = 500.;
 pub const MIT_KD_MAX: f64 = 5.;
 
-// OpenArm PMAX/VMAX/TMAX presets.
-pub const DM8009_DEFAULT_MAPPING_RANGES: MappingRanges = MappingRanges {
-    pmax: 12.5,
-    vmax: 45.,
-    tmax: 54.,
-};
-pub const DM4340_DEFAULT_MAPPING_RANGES: MappingRanges = MappingRanges {
-    pmax: 12.5,
-    vmax: 10.,
-    tmax: 28.,
-};
-pub const DM4310_DEFAULT_MAPPING_RANGES: MappingRanges = MappingRanges {
-    pmax: 12.5,
-    vmax: 30.,
-    tmax: 10.,
-};
-
 /// Identifies a motor setting to read or change. Unrecognized addresses are preserved.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -620,6 +603,22 @@ impl Feedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // OpenArm PMAX/VMAX/TMAX presets.
+    const DM8009_DEFAULT_MAPPING_RANGES: MappingRanges = MappingRanges {
+        pmax: 12.5,
+        vmax: 45.,
+        tmax: 54.,
+    };
+    const DM4340_DEFAULT_MAPPING_RANGES: MappingRanges = MappingRanges {
+        pmax: 12.5,
+        vmax: 10.,
+        tmax: 28.,
+    };
+    const DM4310_DEFAULT_MAPPING_RANGES: MappingRanges = MappingRanges {
+        pmax: 12.5,
+        vmax: 30.,
+        tmax: 10.,
+    };
 
     #[test]
     fn position_velocity_command_matches_wire_bytes_in_both_directions() {
