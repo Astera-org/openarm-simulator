@@ -2,7 +2,7 @@
 use crate::{friction, motor::Motor};
 use anyhow::{Context, Result, ensure};
 use mujoco_rs::{Data, JOINT_HINGE, JOINT_SLIDE, Model, NBIAS, NIMP, NREF, Object, Spec};
-use openarm_can_rs::{MitCommand, MotorStatus};
+use damiao_can_rs::{MitCommand, MotorStatus};
 use openarm_simulator_core_rs::{
     ArmOptions as Arms, ArmStates, Arms as ArmValues, BodyParameters, JointParameters,
     PhysicsConfiguration, Plant, Pose, Stribeck,

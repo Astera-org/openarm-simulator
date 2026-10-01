@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 openarm-simulator-core-rs = { path = "../openarm-simulator-core-rs" }
 mujoco-rs = { path = "../mujoco-rs" }
-openarm-can-rs = { path = "../openarm-can-rs" }
+damiao-can-rs = { path = "../damiao-can-rs" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 http-body-util = "0.1"

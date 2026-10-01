@@ -955,7 +955,7 @@ fn can_client_codec_and_socket_errors() {
     if !in_can_namespace("can_client_codec_and_socket_errors") {
         return;
     }
-    use openarm_can_rs::{
+    use damiao_can_rs::{
         ControlMode, DM4310_DEFAULT_MAPPING_RANGES, Feedback, MotorStatus, Request,
     };
     let mut service =

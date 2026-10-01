@@ -1,6 +1,6 @@
-//! Simulated motor registers, faults and command latching. Wire codecs live in openarm-can-rs.
+//! Simulated motor registers, faults and command latching. Wire codecs live in damiao-can-rs.
 use anyhow::{Result, bail, ensure};
-use openarm_can_rs::{
+use damiao_can_rs::{
     ControlMode, DM4310_DEFAULT_MAPPING_RANGES, DM4340_DEFAULT_MAPPING_RANGES,
     DM8009_DEFAULT_MAPPING_RANGES, Feedback, MappingRanges, MitCommand, MotorStatus,
     RegisterAddress, Request,
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn unsupported_modes_leave_the_motor_unchanged() {
-        use openarm_can_rs::{PositionForceCommand, PositionVelocityCommand, VelocityCommand};
+        use damiao_can_rs::{PositionForceCommand, PositionVelocityCommand, VelocityCommand};
         let mut motor = Motor::new(7);
         motor.command = MitCommand {
             kp: 4.,

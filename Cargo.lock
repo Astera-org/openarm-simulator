@@ -217,6 +217,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "damiao-can-rs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -580,14 +588,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openarm-can-rs"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "openarm-simulator-client-rs"
 version = "0.1.0"
 dependencies = [
@@ -607,7 +607,7 @@ dependencies = [
 name = "openarm-simulator-core-rs"
 version = "0.1.0"
 dependencies = [
- "openarm-can-rs",
+ "damiao-can-rs",
  "serde",
 ]
 
@@ -617,12 +617,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "damiao-can-rs",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
  "mujoco-rs",
- "openarm-can-rs",
  "openarm-simulator-core-rs",
  "openarm-test-model",
  "serde",

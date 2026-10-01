@@ -1,6 +1,6 @@
 //! Shared simulator administration models. This crate has no engine or transport
 //! dependencies. Motor control still goes through CAN.
-pub use openarm_can_rs::{MappingRanges, MitCommand as MotorCommand, MotorStatus};
+pub use damiao_can_rs::{MappingRanges, MitCommand as MotorCommand, MotorStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

@@ -6,5 +6,5 @@ rust-version = "1.89"
 publish = false
 
 [dependencies]
-openarm-can-rs = { path = "../openarm-can-rs", features = ["serde"] }
+damiao-can-rs = { path = "../damiao-can-rs", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

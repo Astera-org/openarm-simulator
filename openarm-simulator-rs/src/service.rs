@@ -2,7 +2,7 @@
 use crate::motor::V1_REPLY_ID_OFFSET;
 use crate::{clock::Clock, physics::Physics};
 use anyhow::{Context, Result, bail, ensure};
-use openarm_can_rs::{MotorStatus, REGISTER_CAN_ID};
+use damiao_can_rs::{MotorStatus, REGISTER_CAN_ID};
 use openarm_simulator_core_rs::{
     Advance, Arm, Configuration, FaultRequest, Push, State, Statistics,
 };
