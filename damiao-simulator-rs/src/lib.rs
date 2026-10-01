@@ -53,6 +53,22 @@ impl MotorConfig {
 const SIMULATED_TEMPERATURE_C: u8 = 25; // No thermal model.
 const SIMULATED_TIMEOUT: u32 = 0; // No firmware watchdog model.
 
+/// Mechanical measurements at the motor's output shaft, in radians, rad/s and Nm.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShaftState {
+    pub position: f64,
+    pub velocity: f64,
+    pub torque: f64,
+}
+
+/// Drive torque is `feedforward - stiffness * position - damping * velocity`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Drive {
+    pub feedforward: f64,
+    pub stiffness: f64,
+    pub damping: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Motor {
     config: MotorConfig,
@@ -68,6 +84,29 @@ pub struct Motor {
 }
 
 impl Motor {
+    /// Supply the mechanical measurements reported by the controller.
+    pub fn observe(&mut self, state: ShaftState) {
+        self.q = state.position;
+        self.dq = state.velocity;
+        self.torque = if self.status == MotorStatus::ENABLED {
+            state.torque
+        } else {
+            0.
+        };
+    }
+
+    /// Obtain the drive law to apply at the motor's output shaft.
+    pub fn drive(&self) -> Drive {
+        if self.status != MotorStatus::ENABLED {
+            return Drive::default();
+        }
+        let c = self.command;
+        Drive {
+            feedforward: c.kp * c.q + c.kd * c.dq + c.tau,
+            stiffness: c.kp,
+            damping: c.kd,
+        }
+    }
     pub fn new(config: MotorConfig) -> Result<Self> {
         config.validate()?;
         Ok(Self {
@@ -247,6 +286,42 @@ mod tests {
         ] {
             assert!(Motor::new(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn drive_and_observation_do_not_require_a_physics_engine() {
+        let mut motor = motor(7, 30., 10.);
+        motor.command = MitCommand {
+            kp: 4.,
+            kd: 2.,
+            q: 3.,
+            dq: 1.,
+            tau: 5.,
+        };
+        assert_eq!(motor.drive(), Drive::default());
+        motor.status = MotorStatus::ENABLED;
+        assert_eq!(
+            motor.drive(),
+            Drive {
+                feedforward: 19.,
+                stiffness: 4.,
+                damping: 2.
+            }
+        );
+        motor.observe(ShaftState {
+            position: 2.,
+            velocity: 0.5,
+            torque: 10.,
+        });
+        assert_eq!((motor.q, motor.dq, motor.torque), (2., 0.5, 10.));
+        motor.status = MotorStatus::OVERCURRENT;
+        assert_eq!(motor.drive(), Drive::default());
+        motor.observe(ShaftState {
+            position: 1.,
+            velocity: 0.,
+            torque: 10.,
+        });
+        assert_eq!(motor.torque, 0.);
     }
 
     fn motor(id: u16, vmax: f64, tmax: f64) -> Motor {

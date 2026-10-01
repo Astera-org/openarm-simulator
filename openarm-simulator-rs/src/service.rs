@@ -1,6 +1,6 @@
 //! Single-threaded physics/CAN owner. Pausing time never pauses socket I/O.
 use crate::motor::V1_REPLY_ID_OFFSET;
-use crate::{clock::Clock, physics::Physics};
+use crate::{clock::Clock, physics::Physics, simulation::Simulation};
 use anyhow::{Context, Result, bail, ensure};
 use damiao_can_rs::{MotorStatus, REGISTER_CAN_ID};
 use openarm_simulator_core_rs::{
@@ -200,7 +200,7 @@ pub enum Request {
     Configuration,
 }
 
-fn administer(physics: &mut Physics, request: Request) -> Result<()> {
+fn administer(physics: &mut Simulation, request: Request) -> Result<()> {
     match request {
         Request::Inspect | Request::Configuration => (),
         Request::Reset | Request::Pause | Request::Unpause | Request::Advance { .. } => {
@@ -239,7 +239,7 @@ fn administer(physics: &mut Physics, request: Request) -> Result<()> {
 fn receive(
     bus: &CanFdSocket,
     side: usize,
-    physics: &mut Physics,
+    physics: &mut Simulation,
     stats: &mut Statistics,
 ) -> Result<()> {
     for _ in 0..RECEIVE_BUDGET {
@@ -353,7 +353,7 @@ pub fn can_sockets(interfaces: &[String; 2], fds: [Option<RawFd>; 2]) -> Result<
 }
 
 fn snapshot(
-    physics: &Physics,
+    physics: &Simulation,
     processed_time_ns: u64,
     paused: bool,
     advancing: bool,
@@ -366,21 +366,21 @@ fn snapshot(
         paused,
         advancing,
         mujoco_version: Physics::version(),
-        timestep_ns: physics.timestep_ns,
-        plant: physics.parameters(),
+        timestep_ns: physics.physics.timestep_ns,
+        plant: physics.physics.parameters(),
         joint_stop_solref: [0.002, 1.],
         joint_stop_solimp: [0.99, 0.999, 0.001, 0.5, 2.],
     }
 }
 
-fn catch_up(physics: &mut Physics, clock: &Clock, stats: &mut Statistics) -> Result<u64> {
+fn catch_up(physics: &mut Simulation, clock: &Clock, stats: &mut Statistics) -> Result<u64> {
     let time_ns = u64::try_from(clock.elapsed()?.as_nanos()).context("clock overflow")?;
     if !clock.paused() {
         stats.max_lag_ns = stats
             .max_lag_ns
-            .max(time_ns - stats.steps * physics.timestep_ns);
+            .max(time_ns - stats.steps * physics.physics.timestep_ns);
     }
-    let count = time_ns / physics.timestep_ns - stats.steps;
+    let count = time_ns / physics.physics.timestep_ns - stats.steps;
     if count > 0 {
         physics.step(count)?;
         stats.steps += count;
@@ -390,7 +390,7 @@ fn catch_up(physics: &mut Physics, clock: &Clock, stats: &mut Statistics) -> Res
 }
 
 pub fn run(
-    physics: &mut Physics,
+    physics: &mut Simulation,
     mut calls: Calls,
     sockets: Vec<CanFdSocket>,
     parent: Option<OwnedFd>,
@@ -398,7 +398,7 @@ pub fn run(
 ) -> Result<State> {
     let timer = Timer::new()?;
     let mut clock = Clock::default();
-    let timestep_ns = physics.timestep_ns;
+    let timestep_ns = physics.physics.timestep_ns;
     let mut processed_time_ns = 0;
     let mut advancing: Option<(u64, mpsc::Sender<Result<Reply>>)> = None;
     let mut stats = Statistics::default();
@@ -535,7 +535,7 @@ pub fn run(
                     }
                 }
                 Request::Configuration => Ok(Reply::Configuration(Box::new(Configuration {
-                    configuration: physics.configuration(),
+                    configuration: physics.physics.configuration(),
                 }))),
                 request => administer(physics, request).map(|()| {
                     Reply::State(Box::new(snapshot(

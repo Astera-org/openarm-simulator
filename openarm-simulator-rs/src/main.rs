@@ -4,6 +4,7 @@ mod http;
 mod motor;
 mod physics;
 mod service;
+mod simulation;
 mod sockets;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
@@ -88,7 +89,7 @@ fn main() -> Result<()> {
     // Internal motor indexes retain their original right/left mapping.
     let interfaces = [args.right_interface, args.left_interface];
     let buses = service::can_sockets(&interfaces, [args.right_can_fd, args.left_can_fd])?;
-    let mut physics = physics::Physics::load(&model, config)?;
+    let mut physics = simulation::Simulation::load(&model, config)?;
     let (control, calls) = service::Control::channel()?;
     let stopped = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {

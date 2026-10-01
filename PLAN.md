@@ -17,7 +17,7 @@ FOR CHOSEN OPTION.
   controller settings; remove OpenArm joint-number construction and dependencies
   on administration models. Move OpenArm presets into the application. Controller
   unit tests must run without MuJoCo, model downloads, or sockets.
-- [ ] 3. Separate motor ownership from mechanics. The runtime owns motors and
+- [x] 3. Separate motor ownership from mechanics. The runtime owns motors and
   scene independently and exchanges mechanical observations and actuation.
   Preserve implicit proportional/derivative integration, encoder conventions,
   clock ownership, and startup/reset equivalence. Controllers receive logical

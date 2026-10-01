@@ -1,11 +1,11 @@
 //! OpenArm plant configuration and motor dynamics on top of the MuJoCo wrapper.
-use crate::{friction, motor::Motor};
+use crate::friction;
 use anyhow::{Context, Result, ensure};
-use damiao_can_rs::{MitCommand, MotorStatus};
+use damiao_simulator_rs::{Drive, ShaftState};
 use mujoco_rs::{Data, JOINT_HINGE, JOINT_SLIDE, Model, NBIAS, NIMP, NREF, Object, Spec};
 use openarm_simulator_core_rs::{
-    ArmOptions as Arms, ArmStates, Arms as ArmValues, BodyParameters, JointParameters,
-    PhysicsConfiguration, Plant, Pose, Stribeck,
+    ArmOptions as Arms, Arms as ArmValues, BodyParameters, JointParameters, PhysicsConfiguration,
+    Plant, Pose, Stribeck,
 };
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path, time::Duration};
@@ -85,7 +85,6 @@ pub struct Physics {
     friction: Vec<VariableFriction>,
     joint_parameters: BTreeMap<String, JointParameters>,
     applied_torque: [[f64; 7]; 2],
-    pub motors: [[Motor; 8]; 2],
 }
 
 impl Physics {
@@ -299,7 +298,6 @@ impl Physics {
             friction,
             joint_parameters,
             applied_torque: [[0.; 7]; 2],
-            motors: std::array::from_fn(|_| std::array::from_fn(|i| crate::motor::v1_motor(i + 1))),
         };
         world.reset()?;
         Ok(world)
@@ -325,34 +323,24 @@ impl Physics {
                 for j in 7..9 {
                     d.qpos[self.index[side].qpos[j]] = -pose[7] * RADIUS;
                 }
-                self.motors[side] = std::array::from_fn(|i| crate::motor::v1_motor(i + 1));
             }
         }
         self.applied_torque = [[0.; 7]; 2];
-        self.configure();
+        self.configure(&[[Drive::default(); 8]; 2]);
         self.configure_friction();
         self.model.forward(&mut self.data);
-        self.feedback();
         Ok(())
     }
 
-    fn configure(&mut self) {
-        {
-            let (m, d) = (self.model.view_mut(), self.data.view_mut());
-            for side in 0..2 {
-                for j in 0..8 {
-                    let motor = self.motors[side][j];
-                    let a = self.index[side].actuator[j];
-                    let c = if motor.status == MotorStatus::ENABLED {
-                        motor.command
-                    } else {
-                        MitCommand::default()
-                    };
-                    d.ctrl[self.index[side].ctrl[j]] =
-                        c.kp * (c.q - self.offsets[side][j]) + c.kd * c.dq + c.tau;
-                    m.actuator_biasprm[a * NBIAS + 1] = -c.kp;
-                    m.actuator_biasprm[a * NBIAS + 2] = -c.kd;
-                }
+    fn configure(&mut self, drives: &[[Drive; 8]; 2]) {
+        let (m, d) = (self.model.view_mut(), self.data.view_mut());
+        for (side, motors) in drives.iter().enumerate() {
+            for (j, drive) in motors.iter().enumerate() {
+                let a = self.index[side].actuator[j];
+                d.ctrl[self.index[side].ctrl[j]] =
+                    drive.feedforward - drive.stiffness * self.offsets[side][j];
+                m.actuator_biasprm[a * NBIAS + 1] = -drive.stiffness;
+                m.actuator_biasprm[a * NBIAS + 2] = -drive.damping;
             }
         }
     }
@@ -374,8 +362,8 @@ impl Physics {
         }
     }
 
-    pub fn step(&mut self, count: u64) -> Result<()> {
-        self.configure();
+    pub fn step(&mut self, count: u64, drives: &[[Drive; 8]; 2]) -> Result<()> {
+        self.configure(drives);
         for _ in 0..count {
             self.configure_friction();
             self.model.step(&mut self.data);
@@ -385,42 +373,29 @@ impl Physics {
                 && self.data.view().qpos.iter().all(|q| q.is_finite()),
             "MuJoCo numerical warning; simulation stopped"
         );
-        self.feedback();
         Ok(())
     }
 
-    fn feedback(&mut self) {
-        {
-            let d = self.data.view();
-            for side in 0..2 {
-                for j in 0..8 {
-                    let ix = self.index[side];
-                    let (q, dq) = if j < 7 {
-                        (d.qpos[ix.qpos[j]], d.qvel[ix.dof[j]])
-                    } else {
-                        (
-                            -(d.qpos[ix.qpos[7]] + d.qpos[ix.qpos[8]]) / (2. * RADIUS),
-                            -(d.qvel[ix.dof[7]] + d.qvel[ix.dof[8]]) / (2. * RADIUS),
-                        )
-                    };
-                    let motor = &mut self.motors[side][j];
-                    motor.q = q + self.offsets[side][j];
-                    motor.dq = dq;
-                    motor.torque = if motor.status == MotorStatus::ENABLED {
-                        d.actuator_force[ix.force[j]]
-                    } else {
-                        0.
-                    };
+    pub fn observations(&self) -> [[ShaftState; 8]; 2] {
+        let d = self.data.view();
+        std::array::from_fn(|side| {
+            std::array::from_fn(|j| {
+                let ix = self.index[side];
+                let (position, velocity) = if j < 7 {
+                    (d.qpos[ix.qpos[j]], d.qvel[ix.dof[j]])
+                } else {
+                    (
+                        -(d.qpos[ix.qpos[7]] + d.qpos[ix.qpos[8]]) / (2. * RADIUS),
+                        -(d.qvel[ix.dof[7]] + d.qvel[ix.dof[8]]) / (2. * RADIUS),
+                    )
+                };
+                ShaftState {
+                    position: position + self.offsets[side][j],
+                    velocity,
+                    torque: d.actuator_force[ix.force[j]],
                 }
-            }
-        }
-    }
-
-    pub fn snapshot(&self) -> ArmStates {
-        ArmValues {
-            right: self.motors[0].map(|m| crate::motor::snapshot(&m)),
-            left: self.motors[1].map(|m| crate::motor::snapshot(&m)),
-        }
+            })
+        })
     }
     pub fn version() -> String {
         mujoco_rs::version()
@@ -500,14 +475,16 @@ impl Physics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn world(config: Config) -> Physics {
-        Physics::load(std::path::Path::new(openarm_test_model::SCENE), config).unwrap()
+    use crate::simulation::Simulation;
+    use damiao_can_rs::{MitCommand, MotorStatus};
+    fn world(config: Config) -> Simulation {
+        Simulation::load(std::path::Path::new(openarm_test_model::SCENE), config).unwrap()
     }
 
     #[test]
     fn nonfinite_state_is_rejected_until_reset() {
         let mut p = world(Config::default());
-        p.data.view_mut().qpos[0] = f64::NAN;
+        p.physics.data.view_mut().qpos[0] = f64::NAN;
         assert_eq!(
             p.step(0).unwrap_err().to_string(),
             "MuJoCo numerical warning; simulation stopped"
@@ -562,8 +539,8 @@ mod tests {
         p.step(1000).unwrap();
         assert!((p.motors[0][7].q + 0.5).abs() < 0.01);
         {
-            for i in &p.index[0].qpos[7..] {
-                assert!((p.data.view().qpos[*i] - 0.5 * RADIUS).abs() < 0.001);
+            for i in &p.physics.index[0].qpos[7..] {
+                assert!((p.physics.data.view().qpos[*i] - 0.5 * RADIUS).abs() < 0.001);
             }
         }
         p.motors[0][7].command = MitCommand {
@@ -644,12 +621,12 @@ mod tests {
         });
         p.reset().unwrap();
         {
-            let (m, d) = (p.model.view(), p.data.view());
-            let dof = p.index[0].dof[3];
+            let (m, d) = (p.physics.model.view(), p.physics.data.view());
+            let dof = p.physics.index[0].dof[3];
             assert_eq!(m.dof_frictionloss[dof], 0.23);
             assert_eq!(m.dof_damping[dof], 0.61);
             assert!((d.qfrc_passive[dof] - 0.47 * 0.19).abs() < 1e-12);
-            assert!((m.dof_frictionloss[p.index[1].dof[3]] - 0.05).abs() < 1e-12);
+            assert!((m.dof_frictionloss[p.physics.index[1].dof[3]] - 0.05).abs() < 1e-12);
         }
     }
 
@@ -670,11 +647,11 @@ mod tests {
                 )]),
                 ..Config::default()
             };
-            assert!(Physics::load(path, config).is_err());
+            assert!(Simulation::load(path, config).is_err());
         }
     }
 
-    fn friction_world(law: Option<Stribeck>, step: f64) -> Physics {
+    fn friction_world(law: Option<Stribeck>, step: f64) -> Simulation {
         let mut p = world(Config {
             friction_scale: 0.,
             joints: BTreeMap::from([(
@@ -690,10 +667,13 @@ mod tests {
         });
         // Isolate passive dissipation from gravity, contacts and joint stops.
         // This remains the full coupled robot mass matrix, not a signal delay.
-        p.model.set_gravity([0.; 3]).unwrap();
-        p.model.set_timestep(Duration::from_secs_f64(step)).unwrap();
-        p.model.disable_contacts_and_limits();
-        p.model.forward(&mut p.data);
+        p.physics.model.set_gravity([0.; 3]).unwrap();
+        p.physics
+            .model
+            .set_timestep(Duration::from_secs_f64(step))
+            .unwrap();
+        p.physics.model.disable_contacts_and_limits();
+        p.physics.model.forward(&mut p.physics.data);
 
         p
     }
@@ -720,29 +700,32 @@ mod tests {
                 ..test_law()
             };
             let mut p = friction_world(Some(law), STEP);
-            let dof = p.index[0].dof[6];
+            let dof = p.physics.index[0].dof[6];
             {
-                p.data.view_mut().qvel[dof] = sign * 2.;
-                p.model.forward(&mut p.data);
+                p.physics.data.view_mut().qvel[dof] = sign * 2.;
+                p.physics.model.forward(&mut p.physics.data);
             }
-            let initial_energy = p.model.kinetic_energy(&mut p.data);
+            let initial_energy = p.physics.model.kinetic_energy(&mut p.physics.data);
             let mut friction_work = 0.;
             for _ in 0..1000 {
                 let before = p.motors[0][6].q;
                 p.step(1).unwrap();
                 {
-                    let d = p.data.view();
+                    let d = p.physics.data.view();
                     let force = d.qfrc_constraint[dof];
                     friction_work += force * (p.motors[0][6].q - before);
-                    assert!(force.abs() <= p.model.view().dof_frictionloss[dof] + 1e-10);
+                    assert!(force.abs() <= p.physics.model.view().dof_frictionloss[dof] + 1e-10);
 
-                    assert!(p.model.kinetic_energy(&mut p.data) <= initial_energy * 1.0001);
+                    assert!(
+                        p.physics.model.kinetic_energy(&mut p.physics.data)
+                            <= initial_energy * 1.0001
+                    );
                 }
             }
             // Other unresisted joints can retain energy transferred through the
             // coupled mass matrix; this test asserts dissipation, not all-arm rest.
             assert!(friction_work < 0.);
-            assert!(p.model.kinetic_energy(&mut p.data) < initial_energy);
+            assert!(p.physics.model.kinetic_energy(&mut p.physics.data) < initial_energy);
         }
     }
 
@@ -818,17 +801,23 @@ mod tests {
         let mut force = [[0.; 7]; 2];
         force[0][6] = 0.75;
         p.push(force).unwrap();
-        let previous = p.parameters();
+        let previous = p.physics.parameters();
         force[1][0] = f64::NAN;
         assert!(p.push(force).is_err());
-        assert_eq!(p.parameters(), previous);
+        assert_eq!(p.physics.parameters(), previous);
         p.step(100).unwrap();
         p.reset().unwrap();
-        assert_eq!(p.applied_torque, [[0.; 7]; 2]);
-        assert_eq!(p.parameters().joints, previous.joints);
+        assert_eq!(p.physics.applied_torque, [[0.; 7]; 2]);
+        assert_eq!(p.physics.parameters().joints, previous.joints);
         {
-            assert_eq!(p.data.view().qfrc_applied[p.index[0].dof[6]], 0.);
-            assert_eq!(p.model.view().dof_frictionloss[p.index[0].dof[6]], 0.6);
+            assert_eq!(
+                p.physics.data.view().qfrc_applied[p.physics.index[0].dof[6]],
+                0.
+            );
+            assert_eq!(
+                p.physics.model.view().dof_frictionloss[p.physics.index[0].dof[6]],
+                0.6
+            );
         }
     }
 
@@ -843,9 +832,17 @@ mod tests {
             },
             ..Config::default()
         });
-        let hit = p.data.contacts().iter().any(|c| {
-            let a = p.model.name(Object::Geom, c.geom[0] as usize).unwrap_or("");
-            let b = p.model.name(Object::Geom, c.geom[1] as usize).unwrap_or("");
+        let hit = p.physics.data.contacts().iter().any(|c| {
+            let a = p
+                .physics
+                .model
+                .name(Object::Geom, c.geom[0] as usize)
+                .unwrap_or("");
+            let b = p
+                .physics
+                .model
+                .name(Object::Geom, c.geom[1] as usize)
+                .unwrap_or("");
             c.dist < -0.001
                 && c.efc_address >= 0
                 && ((a.contains("openarm_left") && b.contains("openarm_right"))
