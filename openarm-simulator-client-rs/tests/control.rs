@@ -2,7 +2,20 @@
 //! same private user/network namespaces, vcan and iproute2 as simulator tests.
 use openarm_simulator_client_rs::{
     Client, Error, StatusCode,
-    models::{Fault, MappingRanges, MotorStatus, Push},
+    models::{
+        AppliedForce, Fault, MappingRanges, MotorStatus, Push, SiteIndex, Spring,
+        uom::si::{
+            angle::radian,
+            angular_velocity::radian_per_second,
+            f32::{Angle as Angle32, AngularVelocity as AngularVelocity32, Torque as Torque32},
+            f64::{Force, Length, Torque, Velocity},
+            force::newton,
+            length::meter,
+            thermodynamic_temperature::degree_celsius,
+            torque::newton_meter,
+            velocity::meter_per_second,
+        },
+    },
 };
 use std::{
     io::{BufRead, BufReader},
@@ -107,14 +120,31 @@ fn control_api_against_simulator() {
             assert_eq!(
                 initial.state["left_joint1"].ranges,
                 MappingRanges {
-                    pmax: 12.5,
-                    vmax: 45.,
-                    tmax: 54.
+                    pmax: Angle32::new::<radian>(12.5),
+                    vmax: AngularVelocity32::new::<radian_per_second>(45.),
+                    tmax: Torque32::new::<newton_meter>(54.)
                 }
             );
-            assert_eq!(initial.state["left_joint1"].mos_temperature, 25);
-            assert_eq!(initial.state["left_joint1"].rotor_temperature, 25);
+            assert_eq!(
+                initial.state["left_joint1"]
+                    .mos_temperature
+                    .get::<degree_celsius>(),
+                25.
+            );
+            assert_eq!(
+                initial.state["left_joint1"]
+                    .rotor_temperature
+                    .get::<degree_celsius>(),
+                25.
+            );
             let configuration = client.configuration().await.unwrap();
+            assert_eq!(
+                configuration.configuration.integrator,
+                openarm_simulator_client_rs::models::Integrator::ImplicitFast
+            );
+            let names = client.names().await.unwrap();
+            let joint = names.joints["openarm_left_joint7"];
+            let site = names.sites["world_site"];
             assert_eq!(initial.timestep_ns, configuration.configuration.timestep_ns);
             assert_eq!(client.pause().await.unwrap(), StatusCode::NO_CONTENT);
             assert_eq!(
@@ -152,14 +182,15 @@ fn control_api_against_simulator() {
                 .unwrap();
             assert_eq!(unknown.state["left_joint1"].status, MotorStatus(2));
             let pushed = client
-                .push(Push::from([("openarm_left_joint7".into(), 0.1)]))
+                .push(Push::from([(joint, Torque::new::<newton_meter>(0.1))]))
                 .await
                 .unwrap();
             assert_eq!(
-                pushed.plant.applied_torque_nm,
-                Push::from([("openarm_left_joint7".into(), 0.1)])
+                pushed.plant.applied_torque,
+                Push::from([(joint, Torque::new::<newton_meter>(0.1))])
             );
             assert_eq!(client.reset().await.unwrap(), StatusCode::OK);
+            assert_eq!(client.names().await.unwrap(), names);
             assert_eq!(client.state().await.unwrap(), initial);
             assert_eq!(client.unpause().await.unwrap(), StatusCode::OK);
             assert_eq!(client.unpause().await.unwrap(), StatusCode::NO_CONTENT);
@@ -185,11 +216,101 @@ fn control_api_against_simulator() {
             ));
             assert!(matches!(
                 client
-                    .push(Push::from([("openarm_left_joint7".into(), f64::NAN)]))
+                    .push(Push::from([(joint, Torque::new::<newton_meter>(f64::NAN))]))
                     .await,
                 Err(Error::InvalidRequest(_))
             ));
             client.reset().await.unwrap();
+            let id = "load / #α";
+            let mut spring = Spring {
+                sites: [site, site],
+                rest_length: Length::new::<meter>(0.1),
+                stiffness: Force::new::<newton>(1.) / Length::new::<meter>(1.),
+                damping: Force::new::<newton>(0.2) / Velocity::new::<meter_per_second>(1.),
+            };
+            let mut force = AppliedForce {
+                site,
+                force: [Force::new::<newton>(0.1); 3].into(),
+                torque: [Torque::new::<newton_meter>(0.); 3].into(),
+            };
+            assert_eq!(
+                client.put_spring(id, &spring).await.unwrap(),
+                StatusCode::CREATED
+            );
+            assert_eq!(client.spring(id).await.unwrap(), spring);
+            assert_eq!(client.springs().await.unwrap()[id], spring);
+            assert_eq!(
+                client.put_force(id, &force).await.unwrap(),
+                StatusCode::CREATED
+            );
+            assert_eq!(client.force(id).await.unwrap(), force);
+            assert_eq!(client.forces().await.unwrap()[id], force);
+            assert!(matches!(
+                client
+                    .push(Push::from([(
+                        openarm_simulator_client_rs::models::JointIndex(usize::MAX),
+                        Torque::new::<newton_meter>(1.)
+                    )]))
+                    .await,
+                Err(Error::Api {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                })
+            ));
+            force.site = SiteIndex(initial.sites.len());
+            assert!(matches!(
+                client.put_force(id, &force).await,
+                Err(Error::Api {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                })
+            ));
+            force.site = site;
+            spring.sites[1] = SiteIndex(initial.sites.len());
+            assert!(matches!(
+                client.put_spring(id, &spring).await,
+                Err(Error::Api {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                })
+            ));
+            spring.sites[1] = site;
+            client.unpause().await.unwrap();
+            force.force.x = Force::new::<newton>(0.2);
+            spring.rest_length = Length::new::<meter>(0.2);
+            assert_eq!(
+                client.put_force(id, &force).await.unwrap(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                client.put_spring(id, &spring).await.unwrap(),
+                StatusCode::NO_CONTENT
+            );
+            client.pause().await.unwrap();
+            let state = client.state().await.unwrap();
+            assert_eq!(state.sites[site.0], initial.sites[site.0]);
+            assert_eq!(state.springs[id].length, Length::new::<meter>(0.));
+            assert_eq!(
+                client.delete_spring(id).await.unwrap(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                client.delete_force(id).await.unwrap(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                client.delete_force(id).await.unwrap(),
+                StatusCode::NO_CONTENT
+            );
+            assert!(matches!(
+                client.force(id).await,
+                Err(Error::Api {
+                    status: StatusCode::NOT_FOUND,
+                    ..
+                })
+            ));
+            client.reset().await.unwrap();
+            assert_eq!(client.state().await.unwrap(), initial);
             // Independent concurrent calls through the shared connection pool.
             let second = client.clone();
             let one = tokio::spawn(async move { second.state().await.unwrap() });

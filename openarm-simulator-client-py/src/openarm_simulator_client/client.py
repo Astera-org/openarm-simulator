@@ -4,13 +4,13 @@ import json
 from http import HTTPStatus
 from typing import TypeVar, overload
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from serde import SerdeError, to_dict
 from serde.json import from_json
 
-from .models import Advance, Configuration, ErrorResponse, Fault, Push, State
+from .models import Advance, AppliedForce, Configuration, ErrorResponse, Fault, Push, PushRequest, SceneNames, Spring, State
 
 T = TypeVar("T")
 
@@ -68,6 +68,10 @@ class Client:
     def state(self) -> State:
         return self._request("GET", "/state", State)
 
+    def names(self) -> SceneNames:
+        """Read the loaded model's name-to-index tables."""
+        return self._request("GET", "/names", SceneNames)
+
     def configuration(self) -> Configuration:
         return self._request("GET", "/configuration", Configuration)
 
@@ -97,4 +101,35 @@ class Client:
         return self._request("POST", "/fault", State, (motor, settings))
 
     def push(self, torques: Push) -> State:
-        return self._request("POST", "/push", State, torques)
+        return self._request("POST", "/push", State, PushRequest(torques))
+
+    def springs(self) -> dict[str, Spring]:
+        """List springs created through this API."""
+        return self._request("GET", "/springs", dict[str, Spring])
+
+    def spring(self, id: str) -> Spring:
+        return self._request("GET", _resource_path("springs", id), Spring)
+
+    def put_spring(self, id: str, spring: Spring) -> HTTPStatus:
+        return self._request("PUT", _resource_path("springs", id), None, spring)
+
+    def delete_spring(self, id: str) -> HTTPStatus:
+        return self._request("DELETE", _resource_path("springs", id), None)
+
+    def forces(self) -> dict[str, AppliedForce]:
+        return self._request("GET", "/forces", dict[str, AppliedForce])
+
+    def force(self, id: str) -> AppliedForce:
+        return self._request("GET", _resource_path("forces", id), AppliedForce)
+
+    def put_force(self, id: str, force: AppliedForce) -> HTTPStatus:
+        return self._request("PUT", _resource_path("forces", id), None, force)
+
+    def delete_force(self, id: str) -> HTTPStatus:
+        return self._request("DELETE", _resource_path("forces", id), None)
+
+
+def _resource_path(collection: str, id: str) -> str:
+    if not id or "\0" in id:
+        raise ValueError("resource ID must be nonempty and contain no NUL")
+    return f"/{collection}/{quote(id, safe='')}"

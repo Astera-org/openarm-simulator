@@ -1,7 +1,18 @@
-use crate::motor::MotorBinding;
+use damiao_simulator_rs::MotorConfig;
+use openarm_simulator_core_rs::uom::si::f64::Angle;
 use openarm_simulator_core_rs::{BodyParameters, JointParameters};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MotorBinding {
+    pub bus: String,
+    pub actuator: String,
+    pub controller: MotorConfig,
+    #[serde(default, rename = "encoder_offset_rad")]
+    pub encoder_offset: Angle,
+}
 
 pub const DEFAULT_TIMESTEP_NS: u64 = 500_000;
 

@@ -479,12 +479,13 @@ fn can_http_and_lifecycle() {
         );
         service.post("/command", json!({}), 404);
         service.post("/step", json!({}), 404);
-        service.post("/push", json!({"openarm_right_joint7": 0.1}), 200);
+        let joint = service.get("/names")["joints"]["openarm_right_joint7"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        service.post("/push", json!({"torques_nm":{(joint.clone()): 0.1}}), 200);
         let state = service.get("/state");
-        assert_eq!(
-            state["plant"]["applied_torque_nm"],
-            json!({"openarm_right_joint7": 0.1})
-        );
+        assert_eq!(state["plant"]["applied_torque_nm"], json!({(joint): 0.1}));
         assert!(state["statistics"]["commands"].as_u64().unwrap() >= 10);
         service.clock("/reset", 200);
         let state = service.get("/state");
@@ -665,7 +666,7 @@ fn clock_start_reset_and_fixed_updates() {
     assert_eq!(initial["advancing"], false);
     assert_eq!(initial["time_ns"], 0);
     assert_eq!(initial["timestep_ns"], period);
-    assert_eq!(initial["state"]["left_joint7"]["q"], 0.);
+    assert_eq!(initial["state"]["left_joint7"]["q_rad"], 0.);
     thread::sleep(Duration::from_millis(20));
     assert_eq!(service.get("/state"), initial);
     service.clock("/pause", 204);
@@ -704,7 +705,11 @@ fn clock_start_reset_and_fixed_updates() {
         json!(["left_joint7", {"status": 9, "silent": true}]),
         200,
     );
-    service.post("/push", json!({"openarm_left_joint7": 0.1}), 200);
+    let joint = service.get("/names")["joints"]["openarm_left_joint7"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    service.post("/push", json!({"torques_nm":{(joint): 0.1}}), 200);
     service.clock("/unpause", 200);
     service.clock("/unpause", 204);
     service.post("/advance", json!({"duration_ns": 1}), 409);
@@ -1061,7 +1066,10 @@ fn configured_motor_addresses_bindings_and_reset() {
     bus.write_frame(&frame(0x7ff, [0x23, 1, 0x55, 21, 0, 0, 0, 0x41]))
         .unwrap();
     assert_eq!(&bus.read_frame().unwrap().data()[4..], &8f32.to_le_bytes());
-    assert_eq!(service.get("/state")["state"]["tool"]["ranges"]["pmax"], 8.);
+    assert_eq!(
+        service.get("/state")["state"]["tool"]["ranges"]["pmax_rad"],
+        8.
+    );
     service.clock("/reset", 200);
     assert_eq!(service.get("/state"), initial);
     service.terminate();

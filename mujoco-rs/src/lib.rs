@@ -9,30 +9,27 @@ use std::{
     slice,
     time::Duration,
 };
+mod scene;
+pub use scene::{AppliedForces, Body, Site};
 
 pub const NREF: usize = ffi::mjNREF as usize;
 pub const NIMP: usize = ffi::mjNIMP as usize;
 pub const NGAIN: usize = ffi::mjNGAIN as usize;
 pub const NBIAS: usize = ffi::mjNBIAS as usize;
-pub const JOINT_HINGE: i32 = ffi::mjJNT_HINGE as i32;
-pub const JOINT_SLIDE: i32 = ffi::mjJNT_SLIDE as i32;
 
-#[derive(Clone, Copy)]
-pub enum Object {
-    Body,
-    Joint,
-    Actuator,
-    Geom,
-}
-impl Object {
-    fn raw(self) -> i32 {
-        (match self {
-            Self::Body => ffi::mjOBJ_BODY,
-            Self::Joint => ffi::mjOBJ_JOINT,
-            Self::Actuator => ffi::mjOBJ_ACTUATOR,
-            Self::Geom => ffi::mjOBJ_GEOM,
-        }) as i32
-    }
+pub use mujoco_core_rs::{
+    ActuatorIndex, BodyIndex, GeomIndex, Integrator, JointIndex, JointKind, Object, ObjectIndex,
+    SiteIndex,
+};
+
+fn object_kind(kind: Object) -> i32 {
+    (match kind {
+        Object::Body => ffi::mjOBJ_BODY,
+        Object::Joint => ffi::mjOBJ_JOINT,
+        Object::Actuator => ffi::mjOBJ_ACTUATOR,
+        Object::Geom => ffi::mjOBJ_GEOM,
+        Object::Site => ffi::mjOBJ_SITE,
+    }) as i32
 }
 
 pub fn version() -> String {
@@ -41,6 +38,7 @@ pub fn version() -> String {
         .into_owned()
 }
 fn check_version() -> Result<()> {
+    scene::install_callback();
     ensure!(
         unsafe { ffi::mj_version() } == ffi::mjVERSION_HEADER as i32,
         "MuJoCo runtime/header version mismatch"
@@ -64,6 +62,26 @@ impl Spec {
         let raw = unsafe {
             ffi::mj_parseXML(
                 path.as_ptr(),
+                std::ptr::null(),
+                error.as_mut_ptr(),
+                error.len() as i32,
+            )
+        };
+        Ok(Self(NonNull::new(raw).with_context(|| {
+            unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })?))
+    }
+    /// Parse an in-memory MJCF or URDF document.
+    /// MuJoCo expects UTF-8 XML. Embedded NUL bytes are rejected.
+    pub fn from_xml_bytes(xml: &[u8]) -> Result<Self> {
+        check_version()?;
+        let xml = CString::new(xml)?;
+        let mut error = [0; 2048];
+        let raw = unsafe {
+            ffi::mj_parseXMLString(
+                xml.as_ptr(),
                 std::ptr::null(),
                 error.as_mut_ptr(),
                 error.len() as i32,
@@ -107,15 +125,21 @@ impl Model {
     pub fn from_xml(path: &Path) -> Result<Self> {
         Spec::from_xml(path)?.compile()
     }
-    pub fn id(&self, kind: Object, name: &str) -> Result<usize> {
-        let text = CString::new(name)?;
-        let id = unsafe { ffi::mj_name2id(self.raw.as_ptr(), kind.raw(), text.as_ptr()) };
-        ensure!(id >= 0, "missing model element {name}");
-        Ok(id as usize)
+    /// Build a model from an in-memory MJCF or URDF document.
+    /// MuJoCo expects UTF-8 XML. Embedded NUL bytes are rejected.
+    pub fn from_xml_bytes(xml: &[u8]) -> Result<Self> {
+        Spec::from_xml_bytes(xml)?.compile()
     }
-    pub fn name(&self, kind: Object, id: usize) -> Option<&str> {
-        let id = i32::try_from(id).ok()?;
-        let ptr = unsafe { ffi::mj_id2name(self.raw.as_ptr(), kind.raw(), id) };
+    pub fn id<I: ObjectIndex>(&self, name: &str) -> Result<I> {
+        let text = CString::new(name)?;
+        let id =
+            unsafe { ffi::mj_name2id(self.raw.as_ptr(), object_kind(I::OBJECT), text.as_ptr()) };
+        ensure!(id >= 0, "missing model element {name}");
+        Ok(I::from(id as usize))
+    }
+    pub fn name<I: ObjectIndex>(&self, id: I) -> Option<&str> {
+        let id = i32::try_from(id.into()).ok()?;
+        let ptr = unsafe { ffi::mj_id2name(self.raw.as_ptr(), object_kind(I::OBJECT), id) };
         if ptr.is_null() {
             None
         } else {
@@ -145,7 +169,8 @@ impl Model {
         }
     }
     /// Configure a stateless scalar actuator for an affine force law.
-    pub fn use_affine_actuator(&mut self, actuator: usize) -> Result<()> {
+    pub fn use_affine_actuator(&mut self, actuator: ActuatorIndex) -> Result<()> {
+        let actuator = actuator.0;
         let m = unsafe { self.raw.as_mut() };
         ensure!(actuator < m.nactuator as usize, "invalid actuator index");
         unsafe {
@@ -168,13 +193,34 @@ impl Model {
         Ok(())
     }
 
-    pub fn integrator(&self) -> &'static str {
+    /// Keep all bodies active when applying custom forces.
+    pub fn disable_sleep(&mut self) {
+        unsafe {
+            self.raw.as_mut().opt.enableflags &= !(ffi::mjENBL_SLEEP as i32);
+        }
+    }
+
+    /// Panics if the joint index is out of range.
+    pub fn joint_kind(&self, index: JointIndex) -> JointKind {
+        let model = unsafe { self.raw.as_ref() };
+        assert!(index.0 < model.njnt as usize);
+        match unsafe { *model.jnt_type.add(index.0) } {
+            x if x == ffi::mjJNT_FREE as i32 => JointKind::Free,
+            x if x == ffi::mjJNT_BALL as i32 => JointKind::Ball,
+            x if x == ffi::mjJNT_SLIDE as i32 => JointKind::Slide,
+            x if x == ffi::mjJNT_HINGE as i32 => JointKind::Hinge,
+            kind => panic!("unknown MuJoCo joint kind: {kind}"),
+        }
+    }
+
+    pub fn integrator(&self) -> Integrator {
         match unsafe { self.raw.as_ref().opt.integrator } {
-            x if x == ffi::mjINT_EULER as i32 => "Euler",
-            x if x == ffi::mjINT_RK4 as i32 => "RK4",
-            x if x == ffi::mjINT_IMPLICIT as i32 => "implicit",
-            x if x == ffi::mjINT_IMPLICITFAST as i32 => "implicitfast",
-            _ => "unknown",
+            x if x == ffi::mjINT_EULER as i32 => Integrator::Euler,
+            x if x == ffi::mjINT_RK4 as i32 => Integrator::Rk4,
+            x if x == ffi::mjINT_IMPLICIT as i32 => Integrator::Implicit,
+            x if x == ffi::mjINT_IMPLICITFAST as i32 => Integrator::ImplicitFast,
+            x if x == ffi::mjINT_DISCRETE as i32 => Integrator::Discrete,
+            integrator => panic!("unknown MuJoCo integrator: {integrator}"),
         }
     }
 }
@@ -202,7 +248,6 @@ pub struct ModelRef<'a> {
     pub nu: usize,
     pub nout: usize,
     pub nbody: usize,
-    pub jnt_type: &'a [i32],
     pub jnt_qposadr: &'a [i32],
     pub jnt_dofadr: &'a [i32],
     pub actuator_ctrlnum: &'a [i32],
@@ -232,7 +277,6 @@ impl Model {
                 nu: m.nu as usize,
                 nout: m.nout as usize,
                 nbody: m.nbody as usize,
-                jnt_type: slice_ref(m.jnt_type, (m.njnt) as usize),
                 jnt_qposadr: slice_ref(m.jnt_qposadr, (m.njnt) as usize),
                 jnt_dofadr: slice_ref(m.jnt_dofadr, (m.njnt) as usize),
                 actuator_ctrlnum: slice_ref(m.actuator_ctrlnum, (m.nactuator) as usize),
@@ -262,7 +306,6 @@ pub struct ModelMut<'a> {
     pub nu: usize,
     pub nout: usize,
     pub nbody: usize,
-    pub jnt_type: &'a [i32],
     pub jnt_qposadr: &'a [i32],
     pub jnt_dofadr: &'a [i32],
     pub actuator_ctrlnum: &'a [i32],
@@ -292,7 +335,6 @@ impl Model {
                 nu: m.nu as usize,
                 nout: m.nout as usize,
                 nbody: m.nbody as usize,
-                jnt_type: slice_ref(m.jnt_type, (m.njnt) as usize),
                 jnt_qposadr: slice_ref(m.jnt_qposadr, (m.njnt) as usize),
                 jnt_dofadr: slice_ref(m.jnt_dofadr, (m.njnt) as usize),
                 actuator_ctrlnum: slice_ref(m.actuator_ctrlnum, (m.nactuator) as usize),
@@ -455,15 +497,86 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn empty_arrays_names_and_independent_data() {
+    fn memory_loading_preserves_diagnostics_and_rejects_embedded_nul() {
+        let error = Spec::from_xml_bytes(b"<mujoco>\n<worldbody invalid='1'/>\n</mujoco>")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("unrecognized attribute: 'invalid'"),
+            "{error}"
+        );
+        assert!(error.contains("line 2"), "{error}");
+        let error = Model::from_xml_bytes(
+            b"<mujoco>\n<worldbody><body name='broken'><joint/></body></worldbody>\n</mujoco>",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("mass and inertia"), "{error}");
+        assert!(error.contains("'broken'"), "{error}");
+        assert!(error.contains("line 2"), "{error}");
+        assert!(Spec::from_xml_bytes(b"<mujoco/>\0trailing content").is_err());
+    }
+
+    #[test]
+    fn file_loading_resolves_relative_includes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scene.xml");
-        std::fs::write(&path, "<mujoco><worldbody><body name='ball'><joint name='slide' type='slide'/><geom type='sphere' size='.1'/></body></worldbody></mujoco>").unwrap();
-        let mut model = Model::from_xml(&path).unwrap();
-        assert!(model.id(Object::Joint, "missing").is_err());
-        assert_eq!(model.name(Object::Body, usize::MAX), None);
+        std::fs::write(&path, "<mujoco><include file='body.xml'/></mujoco>").unwrap();
+        std::fs::write(
+            dir.path().join("body.xml"),
+            "<mujoco><worldbody><body name='included'/></worldbody></mujoco>",
+        )
+        .unwrap();
+        let model = Model::from_xml(&path).unwrap();
+        assert_eq!(model.id::<BodyIndex>("included").unwrap(), BodyIndex(1));
+    }
+
+    #[test]
+    fn joint_kinds_and_integrators_match_compiled_model() {
+        let joints = [
+            ("free", JointKind::Free),
+            ("ball", JointKind::Ball),
+            ("slide", JointKind::Slide),
+            ("hinge", JointKind::Hinge),
+        ];
+        let bodies: String = joints.iter().map(|(name, _)| format!(
+            "<body><joint name='{name}' type='{name}'/><geom type='sphere' size='.1'/></body>"
+        )).collect();
+        for (name, expected) in [
+            ("Euler", Integrator::Euler),
+            ("RK4", Integrator::Rk4),
+            ("implicit", Integrator::Implicit),
+            ("implicitfast", Integrator::ImplicitFast),
+            ("discrete", Integrator::Discrete),
+        ] {
+            let model = Model::from_xml_bytes(
+                format!(
+                    "<mujoco><option integrator='{name}'/><worldbody>{bodies}</worldbody></mujoco>"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(model.integrator(), expected);
+            for (name, kind) in joints {
+                assert_eq!(model.joint_kind(model.id(name).unwrap()), kind);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_arrays_names_and_independent_data() {
+        let mut model = Model::from_xml_bytes(b"<mujoco><worldbody><body name='ball'><joint name='slide' type='slide'/><geom type='sphere' size='.1'/><site name='tip' pos='.2 0 0'/></body></worldbody></mujoco>").unwrap();
+        assert!(model.id::<JointIndex>("missing").is_err());
+        assert_eq!(model.name(BodyIndex(usize::MAX)), None);
         assert!(model.view().actuator_biasprm.is_empty());
+        assert_eq!(
+            model.names::<SiteIndex>().collect::<Vec<_>>(),
+            [("tip", SiteIndex(0))]
+        );
         model.set_timestep(Duration::from_millis(1)).unwrap();
         let mut first = Data::new(&model).unwrap();
         let mut second = Data::new(&model).unwrap();
@@ -471,6 +584,14 @@ mod tests {
         model.step(&mut first);
         assert!(first.warnings().iter().all(|w| w.number == 0));
         assert_ne!(first.view().qpos[0], 0.);
+        model.forward(&mut first);
+        let site = model.site(&first, model.id::<SiteIndex>("tip").unwrap());
+        assert_eq!(site.body(), model.id::<BodyIndex>("ball").unwrap());
+        assert_eq!(*site.position(), [0.2, 0., first.view().qpos[0]]);
+        assert_eq!(site.orientation(), [1., 0., 0., 0.]);
+        assert_eq!(site.velocity(), [0., 0., first.view().qvel[0]]);
+        let body = model.body(&first, site.body());
+        assert_eq!(*body.position(), [0., 0., first.view().qpos[0]]);
         assert_eq!(second.view().qpos[0], 0.);
         assert!(second.view().ctrl.is_empty());
         assert!(second.view_mut().actuator_force.is_empty());
@@ -485,24 +606,25 @@ mod tests {
         // Data owns its arrays and can be read, edited and freed after the model.
         first.view_mut().qpos[0] = 2.;
         assert_eq!(first.view().qpos[0], 2.);
-        std::fs::write(&path, "not xml").unwrap();
-        assert!(Spec::from_xml(&path).is_err());
     }
 
     #[test]
     fn reject_mismatched_data_before_calling_mujoco() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("scene.xml");
-        std::fs::write(&path, "<mujoco/>").unwrap();
-        let original = Model::from_xml(&path).unwrap();
+        let original = Model::from_xml_bytes(b"<mujoco/>").unwrap();
         let mut data = Data::new(&original).unwrap();
         drop(original);
-        let mut other = Model::from_xml(&path).unwrap();
-        let operations: [fn(&mut Model, &mut Data); 5] = [
+        let mut other = Model::from_xml_bytes(b"<mujoco/>").unwrap();
+        let operations: [fn(&mut Model, &mut Data); 7] = [
             |m, d| m.reset_data(d),
             |m, d| m.forward(d),
             |m, d| m.set_constants(d),
             |m, d| m.step(d),
+            |m, d| {
+                m.site(d, SiteIndex(0));
+            },
+            |m, d| {
+                m.body(d, BodyIndex(0));
+            },
             |m, d| {
                 m.kinetic_energy(d);
             },

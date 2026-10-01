@@ -6,6 +6,7 @@ rust-version = "1.89"
 publish = false
 
 [dependencies]
+percent-encoding = "2"
 openarm-simulator-core-rs = { path = "../openarm-simulator-core-rs" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "client"] }

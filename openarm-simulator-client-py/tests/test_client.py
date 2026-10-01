@@ -16,7 +16,7 @@ import unittest
 from serde.json import from_json, to_json
 
 from openarm_simulator_client import APIError, Client
-from openarm_simulator_client.models import Configuration, Fault, MappingRanges, MotorCommand, State
+from openarm_simulator_client.models import AppliedForce, Configuration, Fault, HingeJointParameters, Integrator, MappingRanges, MotorCommand, SiteIndex, SlideJointParameters, Spring, State
 
 
 class ClientTest(unittest.TestCase):
@@ -71,13 +71,19 @@ class ClientTest(unittest.TestCase):
                 client = Client(url)
                 state = client.state()
                 configuration = client.configuration()
+                self.assertIs(configuration.configuration.integrator, Integrator.IMPLICIT_FAST)
+                names = client.names()
+                joint = names.joints["openarm_left_joint7"]
+                site = names.sites["world_site"]
                 self.assertEqual(from_json(State, to_json(state)), state)
                 self.assertEqual(from_json(Configuration, to_json(configuration)), configuration)
+                self.assertIsInstance(configuration.configuration.joints[names.joints["openarm_left_joint1"]], HingeJointParameters)
+                self.assertIsInstance(configuration.configuration.joints[names.joints["openarm_left_finger_joint1"]], SlideJointParameters)
                 self.assertEqual(len(state.state), 16)
                 self.assertIsInstance(state.state["left_joint1"].command, MotorCommand)
                 self.assertEqual(state.state["left_joint1"].ranges, MappingRanges(12.5, 45.0, 54.0))
-                self.assertEqual(state.state["left_joint1"].mos_temperature, 25)
-                self.assertEqual(state.state["left_joint1"].rotor_temperature, 25)
+                self.assertEqual(state.state["left_joint1"].mos_temperature_k, 298.15)
+                self.assertEqual(state.state["left_joint1"].rotor_temperature_k, 298.15)
                 self.assertIsInstance(configuration.configuration.encoder_offsets_rad, dict)
                 self.assertEqual(state.timestep_ns, configuration.configuration.timestep_ns)
 
@@ -91,9 +97,10 @@ class ClientTest(unittest.TestCase):
                 self.assertEqual(cleared.state["left_joint1"].status, 0)
                 self.assertFalse(cleared.state["left_joint1"].silent)
 
-                push = client.push({"openarm_left_joint7": 0.1})
-                self.assertEqual(push.plant.applied_torque_nm, {"openarm_left_joint7": 0.1})
+                push = client.push({joint: 0.1})
+                self.assertEqual(push.plant.applied_torque_nm, {joint: 0.1})
                 self.assertEqual(client.reset(), HTTPStatus.OK)
+                self.assertEqual(client.names(), names)
                 self.assertEqual(client.state(), state)
                 self.assertTrue(state.paused)
                 self.assertEqual(state.time_ns, 0)
@@ -116,11 +123,38 @@ class ClientTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         client.advance(duration)
 
+                id = "load / #α"
+                spring = Spring((site, site), 0.1, 1.0, 0.2)
+                force = AppliedForce(site, (0.1, 0.0, 0.0), (0.0, 0.0, 0.0))
+                self.assertEqual(client.put_spring(id, spring), HTTPStatus.CREATED)
+                self.assertEqual(client.spring(id), spring)
+                self.assertEqual(client.springs()[id], spring)
+                self.assertEqual(client.put_force(id, force), HTTPStatus.CREATED)
+                self.assertEqual(client.force(id), force)
+                self.assertEqual(client.forces()[id], force)
+                with self.assertRaises(APIError) as error:
+                    client.put_force(id, AppliedForce(SiteIndex(len(state.sites)), force.force_world_n, force.torque_world_nm))
+                self.assertEqual(error.exception.status, 400)
+                client.unpause()
+                self.assertEqual(client.put_force(id, force), HTTPStatus.NO_CONTENT)
+                self.assertEqual(client.put_spring(id, spring), HTTPStatus.NO_CONTENT)
+                client.pause()
+                observed = client.state()
+                self.assertEqual(observed.springs[id].length_m, 0.0)
+                self.assertEqual(observed.sites[site], state.sites[site])
+                self.assertEqual(client.delete_spring(id), HTTPStatus.NO_CONTENT)
+                self.assertEqual(client.delete_force(id), HTTPStatus.NO_CONTENT)
+                with self.assertRaises(APIError) as error:
+                    client.force(id)
+                self.assertEqual(error.exception.status, 404)
+                client.reset()
+                self.assertEqual(client.state(), state)
+
                 with self.assertRaisesRegex(APIError, "motor") as error:
                     client.fault("left_joint0", Fault(status=9))
                 self.assertEqual(error.exception.status, 400)
                 with self.assertRaises(ValueError):
-                    client.push({"openarm_left_joint7": float("nan")})
+                    client.push({joint: float("nan")})
         finally:
             process.terminate()
             try:

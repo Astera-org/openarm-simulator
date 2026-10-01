@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Shared, checksum-verified SDK/model downloads in the user's platform cache.
 use sha2::{Digest, Sha256};
 use std::{

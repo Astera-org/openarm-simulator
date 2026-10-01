@@ -35,7 +35,7 @@ pub fn activation_fd(explicit: Option<RawFd>) -> Result<Option<RawFd>> {
 }
 
 // Validate all numbers before opening anything that could reuse a closed fd.
-pub fn validate(fds: &[Option<RawFd>]) -> Result<()> {
+pub fn validate_fds(fds: &[Option<RawFd>]) -> Result<()> {
     let mut seen = HashSet::new();
     for fd in fds.iter().flatten() {
         ensure!(
@@ -57,7 +57,7 @@ pub fn validate(fds: &[Option<RawFd>]) -> Result<()> {
     Ok(())
 }
 
-pub fn parent(fd: RawFd) -> Result<OwnedFd> {
+pub fn parent_fd(fd: RawFd) -> Result<OwnedFd> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     ensure!(
         unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0,
@@ -86,7 +86,7 @@ fn listener(fd: RawFd) -> Result<Socket> {
     Ok(socket)
 }
 
-pub fn http(host: &str, port: u16, fd: Option<RawFd>) -> Result<TcpListener> {
+pub fn http_listener(host: &str, port: u16, fd: Option<RawFd>) -> Result<TcpListener> {
     match fd {
         Some(fd) => Ok(listener(fd)?.into()),
         None => Ok(TcpListener::bind((host, port))?),

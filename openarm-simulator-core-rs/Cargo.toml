@@ -6,5 +6,8 @@ rust-version = "1.89"
 publish = false
 
 [dependencies]
+mujoco-core-rs = { path = "../mujoco-core-rs", features = ["serde"] }
 damiao-can-rs = { path = "../damiao-can-rs", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+mint = { version = "0.5.9", features = ["serde"] }
+uom = { version = "0.38", default-features = false, features = ["std", "si", "f32", "f64", "serde"] }

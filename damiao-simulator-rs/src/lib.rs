@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Damiao motor-controller emulation. Mechanical observations are supplied by the caller.
 use damiao_can_rs::{
     ControlMode, Feedback, MappingRanges, MitCommand, MotorStatus, REGISTER_CAN_ID,

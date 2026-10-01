@@ -96,6 +96,7 @@ fn main() {
         .clang_arg("-isystem")
         .clang_arg(cc_headers.trim())
         .allowlist_function("(mj_|mjs_).*")
+        .allowlist_function("mju_mat2Quat")
         .allowlist_type("(mj|mjt|mjs).*")
         .allowlist_var("mj.*")
         .prepend_enum_name(false)

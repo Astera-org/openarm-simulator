@@ -1,4 +1,4 @@
-use crate::service::{Conflict, Control, Reply, Request as AdminRequest, Unavailable};
+use super::{Conflict, Control, NotFound, Reply, Request as AdminRequest, Unavailable};
 use anyhow::{Result, ensure};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
@@ -29,10 +29,20 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
         ));
     }
     let path = request.uri().path().to_owned();
+    let method = request.method().clone();
+    let resource_path = path.strip_prefix('/').and_then(|path| {
+        let (collection, id) = path
+            .split_once('/')
+            .map_or((path, None), |(c, id)| (c, Some(id)));
+        matches!(collection, "springs" | "forces").then_some((collection, id))
+    });
     let no_args = match (request.method(), path.as_str()) {
-        (&Method::GET, "/state" | "/configuration")
+        (&Method::GET, "/state" | "/configuration" | "/names")
         | (&Method::POST, "/reset" | "/pause" | "/unpause") => true,
         (&Method::POST, "/advance" | "/fault" | "/push") => false,
+        (&Method::GET, _) if resource_path.is_some() => true,
+        (&Method::PUT, _) if resource_path.is_some_and(|(_, id)| id.is_some()) => false,
+        (&Method::DELETE, _) if resource_path.is_some_and(|(_, id)| id.is_some()) => true,
         _ => {
             return Ok((
                 StatusCode::NOT_FOUND,
@@ -41,7 +51,7 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
         }
     };
     let mut payload = Value::Null;
-    if request.method() == Method::POST {
+    if matches!(method, Method::POST | Method::PUT | Method::DELETE) {
         ensure!(
             headers.get_all(header::CONTENT_LENGTH).iter().count() <= 1
                 && !headers.contains_key(header::TRANSFER_ENCODING),
@@ -103,42 +113,69 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
             payload = serde_json::from_slice(&body)?;
         }
     }
-    let message = match path.as_str() {
-        "/state" => AdminRequest::Inspect,
-        "/configuration" => AdminRequest::Configuration,
-        "/reset" => AdminRequest::Reset,
-        "/pause" => AdminRequest::Pause,
-        "/unpause" => AdminRequest::Unpause,
-        "/advance" => {
-            ensure!(payload.is_object(), "advance payload must be an object");
-            AdminRequest::Advance {
-                payload: serde_json::from_value(payload)?,
+    let message = if let Some((collection, id)) = resource_path {
+        let id = id
+            .map(|id| -> Result<String> {
+                ensure!(
+                    !id.is_empty() && !id.contains('/'),
+                    "expected one nonempty resource ID"
+                );
+                let id = percent_encoding::percent_decode_str(id)
+                    .decode_utf8()?
+                    .into_owned();
+                ensure!(!id.contains('\0'), "resource ID contains NUL");
+                Ok(id)
+            })
+            .transpose()?;
+        match (collection, method, id) {
+            ("springs", Method::GET, id) => AdminRequest::Springs(id),
+            ("forces", Method::GET, id) => AdminRequest::Forces(id),
+            ("springs", Method::PUT, Some(id)) => {
+                AdminRequest::PutSpring(id, serde_json::from_value(payload)?)
             }
-        }
-        "/push" => {
-            ensure!(
-                payload.is_object(),
-                "payload must be an object keyed by joint name"
-            );
-            AdminRequest::Push {
-                payload: serde_json::from_value(payload)?,
+            ("forces", Method::PUT, Some(id)) => {
+                AdminRequest::PutForce(id, serde_json::from_value(payload)?)
             }
+            ("springs", Method::DELETE, Some(id)) => AdminRequest::DeleteSpring(id),
+            ("forces", Method::DELETE, Some(id)) => AdminRequest::DeleteForce(id),
+            _ => unreachable!("route validated above"),
         }
-        "/fault" => {
-            ensure!(payload[1].is_object(), "fault settings must be an object");
-            AdminRequest::Fault {
-                payload: serde_json::from_value(payload)?,
+    } else {
+        match path.as_str() {
+            "/state" => AdminRequest::Inspect,
+            "/configuration" => AdminRequest::Configuration,
+            "/names" => AdminRequest::Names,
+            "/reset" => AdminRequest::Reset,
+            "/pause" => AdminRequest::Pause,
+            "/unpause" => AdminRequest::Unpause,
+            "/advance" => {
+                ensure!(payload.is_object(), "advance payload must be an object");
+                AdminRequest::Advance {
+                    payload: serde_json::from_value(payload)?,
+                }
             }
+            "/push" => AdminRequest::Push {
+                payload: serde_json::from_value(payload)?,
+            },
+            "/fault" => {
+                ensure!(payload[1].is_object(), "fault settings must be an object");
+                AdminRequest::Fault {
+                    payload: serde_json::from_value(payload)?,
+                }
+            }
+            _ => unreachable!("route validated above"),
         }
-        _ => unreachable!("route validated above"),
     };
     // Waiting for the physics owner must not block the network event loop.
     Ok(
         match tokio::task::spawn_blocking(move || control.call(message)).await?? {
+            Reply::Names(value) => (StatusCode::OK, serde_json::to_value(value)?),
             Reply::State(value) => (StatusCode::OK, serde_json::to_value(value)?),
             Reply::Configuration(value) => (StatusCode::OK, serde_json::to_value(value)?),
             Reply::Done => (StatusCode::OK, Value::Null),
             Reply::Unchanged => (StatusCode::NO_CONTENT, Value::Null),
+            Reply::Created => (StatusCode::CREATED, Value::Null),
+            Reply::Value(value) => (StatusCode::OK, value),
         },
     )
 }
@@ -152,6 +189,8 @@ async fn handle(
             StatusCode::SERVICE_UNAVAILABLE
         } else if error.is::<Conflict>() {
             StatusCode::CONFLICT
+        } else if error.is::<NotFound>() {
+            StatusCode::NOT_FOUND
         } else {
             StatusCode::BAD_REQUEST
         };
@@ -180,7 +219,7 @@ async fn handle(
     Ok(response.body(Full::new(body)).unwrap())
 }
 
-pub fn start(listener: TcpListener, control: Control) -> Result<()> {
+pub fn start_http(listener: TcpListener, control: Control) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

@@ -1,5 +1,5 @@
 [workspace]
-members = ["download-cache-rs", "mujoco-sys-rs", "mujoco-rs", "damiao-can-rs", "damiao-simulator-rs", "openarm-simulator-core-rs", "openarm-simulator-client-rs", "openarm-simulator-rs", "openarm-simulator-rs/tests/model"]
+members = ["download-cache-rs", "mujoco-core-rs", "mujoco-sys-rs", "mujoco-rs", "damiao-can-rs", "damiao-simulator-rs", "openarm-simulator-core-rs", "openarm-simulator-client-rs", "openarm-simulator-rs", "openarm-simulator-rs/tests/model"]
 default-members = ["openarm-simulator-rs"]
 resolver = "3"
 

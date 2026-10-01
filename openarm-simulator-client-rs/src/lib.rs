@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! Asynchronous HTTP administration client for an existing simulator. Run on a
 //! Tokio runtime with I/O and time enabled. No process launching or CAN control.
 //! Requests are never automatically retried; redirects are not followed.
@@ -13,8 +14,12 @@ use serde::de::DeserializeOwned;
 use std::{error::Error as StdError, time::Duration};
 
 pub use hyper::StatusCode;
-use models::{Advance, Configuration, ErrorResponse, Fault, Push, State};
+use models::{
+    Advance, AppliedForce, Configuration, ErrorResponse, Fault, Push, PushRequest, SceneNames,
+    Spring, State,
+};
 pub use openarm_simulator_core_rs as models;
+use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -132,8 +137,61 @@ impl Client {
     pub async fn state(&self) -> Result<State> {
         self.read(Method::GET, "/state", Vec::new()).await
     }
+    /// Read the loaded model's name-to-index tables.
+    pub async fn names(&self) -> Result<SceneNames> {
+        self.read(Method::GET, "/names", Vec::new()).await
+    }
     pub async fn configuration(&self) -> Result<Configuration> {
         self.read(Method::GET, "/configuration", Vec::new()).await
+    }
+    /// List springs created through this API. MJCF tendons remain part of the scene.
+    pub async fn springs(&self) -> Result<BTreeMap<String, Spring>> {
+        self.read(Method::GET, "/springs", Vec::new()).await
+    }
+    pub async fn spring(&self, id: &str) -> Result<Spring> {
+        self.read(Method::GET, &resource_path("springs", id)?, Vec::new())
+            .await
+    }
+    pub async fn put_spring(&self, id: &str, spring: &Spring) -> Result<StatusCode> {
+        self.edit(
+            Method::PUT,
+            &resource_path("springs", id)?,
+            serde_json::to_vec(spring)?,
+        )
+        .await
+    }
+    pub async fn delete_spring(&self, id: &str) -> Result<StatusCode> {
+        self.edit(Method::DELETE, &resource_path("springs", id)?, Vec::new())
+            .await
+    }
+    pub async fn forces(&self) -> Result<BTreeMap<String, AppliedForce>> {
+        self.read(Method::GET, "/forces", Vec::new()).await
+    }
+    pub async fn force(&self, id: &str) -> Result<AppliedForce> {
+        self.read(Method::GET, &resource_path("forces", id)?, Vec::new())
+            .await
+    }
+    pub async fn put_force(&self, id: &str, force: &AppliedForce) -> Result<StatusCode> {
+        self.edit(
+            Method::PUT,
+            &resource_path("forces", id)?,
+            serde_json::to_vec(force)?,
+        )
+        .await
+    }
+    pub async fn delete_force(&self, id: &str) -> Result<StatusCode> {
+        self.edit(Method::DELETE, &resource_path("forces", id)?, Vec::new())
+            .await
+    }
+    async fn edit(&self, method: Method, path: &str, body: Vec<u8>) -> Result<StatusCode> {
+        let (status, bytes) = self.request(method, path, body).await?;
+        if !matches!(status, StatusCode::CREATED | StatusCode::NO_CONTENT) || !bytes.is_empty() {
+            return Err(Error::Api {
+                status,
+                message: "expected empty 201 or 204 response".into(),
+            });
+        }
+        Ok(status)
     }
     /// Restore startup state and pause the clock.
     pub async fn reset(&self) -> Result<StatusCode> {
@@ -164,12 +222,28 @@ impl Client {
         .await
     }
     pub async fn push(&self, torques: Push) -> Result<State> {
-        if !torques.values().all(|v| v.is_finite()) {
+        if !torques.values().all(|v| v.value.is_finite()) {
             return Err(Error::InvalidRequest(
                 "applied torques must be finite".into(),
             ));
         }
-        self.read(Method::POST, "/push", serde_json::to_vec(&torques)?)
-            .await
+        self.read(
+            Method::POST,
+            "/push",
+            serde_json::to_vec(&PushRequest { torques })?,
+        )
+        .await
     }
+}
+
+fn resource_path(collection: &str, id: &str) -> Result<String> {
+    if id.is_empty() || id.contains('\0') {
+        return Err(Error::InvalidRequest(
+            "resource ID must be nonempty and contain no NUL".into(),
+        ));
+    }
+    Ok(format!(
+        "/{collection}/{}",
+        percent_encoding::utf8_percent_encode(id, percent_encoding::NON_ALPHANUMERIC)
+    ))
 }

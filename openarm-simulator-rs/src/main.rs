@@ -1,12 +1,7 @@
-mod clock;
 mod config;
-mod friction;
-mod http;
-mod motor;
 mod physics;
-mod service;
+mod runtime;
 mod simulation;
-mod sockets;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use serde_json::{Value, json};
@@ -78,12 +73,12 @@ fn configuration(path: Option<&Path>) -> Result<config::Config> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let http_fd = sockets::activation_fd(args.http_fd)?;
+    let http_fd = runtime::activation_fd(args.http_fd)?;
     let mut descriptors = vec![http_fd, args.parent_fd];
     descriptors.extend(args.can_fd.iter().map(|(_, fd)| Some(*fd)));
-    sockets::validate(&descriptors)?;
-    let parent = args.parent_fd.map(sockets::parent).transpose()?;
-    let listener = sockets::http(&args.host, args.port, http_fd)?;
+    runtime::validate_fds(&descriptors)?;
+    let parent = args.parent_fd.map(runtime::parent_fd).transpose()?;
+    let listener = runtime::http_listener(&args.host, args.port, http_fd)?;
     let address = listener.local_addr()?;
     let mut config = configuration(args.config.as_deref())?;
     let mut overrides = std::collections::BTreeSet::new();
@@ -113,18 +108,18 @@ fn main() -> Result<()> {
         .collect();
     let model = args.model.canonicalize().context("external model path")?;
     ensure!(model.is_file(), "model must be an MJCF file");
-    let mut physics = simulation::Simulation::load(&model, config)?;
-    let buses = service::can_sockets(&interfaces, &fds, &physics)?;
-    let (control, calls) = service::Control::channel()?;
+    let mut simulation = simulation::Simulation::load(&model, config)?;
+    let buses = runtime::can_sockets(&interfaces, &fds, &simulation)?;
+    let (control, calls) = runtime::Control::channel()?;
     let stopped = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, Arc::clone(&stopped))?;
         control.wake_on_signal(signal)?;
     }
-    http::start(listener, control)?;
+    runtime::start_http(listener, control)?;
     println!("HTTP administration: http://{address}");
     std::io::stdout().flush()?;
-    service::run(&mut physics, calls, buses, parent, &stopped)?;
+    runtime::run(&mut simulation, calls, buses, parent, &stopped)?;
 
     Ok(())
 }

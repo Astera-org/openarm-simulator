@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 // Motor manual (English translation): MIT, status codes, modes, and registers.
 // https://damiao.enactic.ai/en/products/hardware/dm-j4340p-2ec-v1.0/
 // Damiao Drive Control Protocol V1.4 (Chinese): §2.4 (ranges), §4 (CAN commands).
