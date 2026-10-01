@@ -1,0 +1,11 @@
+[package]
+name = "download-cache-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+directories = "6"
+sha2 = "0.10"
+tempfile = "3"

@@ -1,0 +1,28 @@
+[package]
+name = "openarm-simulator-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+openarm-simulator-core-rs = { path = "../openarm-simulator-core-rs" }
+mujoco-rs = { path = "../mujoco-rs" }
+openarm-can-rs = { path = "../openarm-can-rs" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+socket2 = { version = "0.6", features = ["all"] }
+socketcan = { version = "4", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+openarm-test-model = { path = "tests/model" }
+tempfile = "3"

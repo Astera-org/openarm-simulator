@@ -1,0 +1,134 @@
+"""Run with: uv run python -m unittest discover -s tests -v
+
+Requires Linux user/network namespaces and vcan. Cargo builds the simulator
+and provisions its pinned test model using the shared asset cache.
+"""
+
+import json
+from http import HTTPStatus
+import os
+from pathlib import Path
+import select
+import socket
+import subprocess
+import unittest
+
+from serde.json import from_json, to_json
+
+from openarm_simulator_client import APIError, Client
+from openarm_simulator_client.models import Configuration, Fault, MappingRanges, MotorCommand, Push, State
+
+
+class ClientTest(unittest.TestCase):
+    def test_control_api(self):
+        repo = Path(__file__).resolve().parents[2]
+        build = subprocess.run(
+            [
+                "cargo", "build", "--locked", "--message-format=json-render-diagnostics",
+                "-p", "openarm-simulator-rs", "-p", "openarm-test-model",
+            ],
+            cwd=repo, stdout=subprocess.PIPE, text=True, check=True,
+        )
+        binary = model = None
+        for line in build.stdout.splitlines():
+            if not line.startswith("{"):
+                continue
+            message = json.loads(line)
+            if message.get("target", {}).get("name") == "openarm-simulator-rs":
+                binary = message["executable"]
+            for key, value in message.get("env", []):
+                if key == "OPENARM_TEST_MODEL":
+                    model = value
+        self.assertIsNotNone(binary, "Cargo did not report the simulator executable")
+        self.assertIsNotNone(model, "Cargo did not report the test model")
+
+        env = os.environ.copy()
+        for key in (
+            "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDS_FIRST_FD", "OPENARM_SIMULATOR_CONFIG",
+        ):
+            env.pop(key, None)
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+            process = subprocess.Popen(
+                [
+                    "unshare", "--user", "--map-root-user", "--net", "sh", "-ec",
+                    'ip link set lo up; for bus in can0 can1; do '
+                    'ip link add "$bus" type vcan; ip link set "$bus" mtu 72 up; '
+                    'done; exec "$@"',
+                    "namespace", binary, "--model", model,
+                    "--http-fd", str(listener.fileno()),
+                ],
+                pass_fds=(listener.fileno(),), stdout=subprocess.PIPE, text=True, env=env,
+            )
+        try:
+            with process.stdout:
+                self.assertTrue(select.select([process.stdout], [], [], 30)[0], "startup timeout")
+                self.assertEqual(process.stdout.readline().strip(), f"HTTP administration: {url}")
+
+                client = Client(url)
+                state = client.state()
+                configuration = client.configuration()
+                self.assertEqual(from_json(State, to_json(state)), state)
+                self.assertEqual(from_json(Configuration, to_json(configuration)), configuration)
+                self.assertEqual(len(state.state.left), 8)
+                self.assertIsInstance(state.state.left[0].command, MotorCommand)
+                self.assertEqual(state.state.left[0].ranges, MappingRanges(12.5, 45.0, 54.0))
+                self.assertEqual(state.state.left[0].mos_temperature, 25)
+                self.assertEqual(state.state.left[0].rotor_temperature, 25)
+                self.assertIsInstance(configuration.configuration.encoder_offsets_rad.left, tuple)
+                self.assertEqual(state.timestep_ns, configuration.configuration.timestep_ns)
+
+                fault = client.fault("left", 1, Fault(status=9, silent=True))
+                self.assertEqual(fault.state.left[0].status, 9)
+                self.assertTrue(fault.state.left[0].silent)
+                self.assertEqual(fault.state.right[0].status, 0)
+                unknown = client.fault("left", 1, Fault(status=2))
+                self.assertEqual(unknown.state.left[0].status, 2)
+                cleared = client.fault("left", 1, Fault(status=0, silent=False))
+                self.assertEqual(cleared.state.left[0].status, 0)
+                self.assertFalse(cleared.state.left[0].silent)
+
+                push = client.push(Push(left=(0.1,) * 7))
+                self.assertEqual(push.plant.applied_torque_nm.left, (0.1,) * 7)
+                self.assertEqual(push.plant.applied_torque_nm.right, (0.0,) * 7)
+                self.assertEqual(client.reset(), HTTPStatus.OK)
+                self.assertEqual(client.state(), state)
+                self.assertTrue(state.paused)
+                self.assertEqual(state.time_ns, 0)
+                self.assertEqual(client.pause(), HTTPStatus.NO_CONTENT)
+                self.assertEqual(client.advance(state.timestep_ns - 1), HTTPStatus.OK)
+                self.assertEqual(client.state().statistics.steps, 0)
+                self.assertEqual(client.advance(1), HTTPStatus.OK)
+                self.assertEqual(client.state().statistics.steps, 1)
+                self.assertEqual(client.state().time_ns, state.timestep_ns)
+                self.assertEqual(client.unpause(), HTTPStatus.OK)
+                self.assertEqual(client.unpause(), HTTPStatus.NO_CONTENT)
+                with self.assertRaises(APIError) as error:
+                    client.advance(1)
+                self.assertEqual(error.exception.status, 409)
+                self.assertEqual(client.pause(), HTTPStatus.OK)
+                self.assertEqual(client.pause(), HTTPStatus.NO_CONTENT)
+                client.reset()
+                self.assertEqual(client.state(), state)
+                for duration in [-1, 1.0, True, 2**64]:
+                    with self.assertRaises(ValueError):
+                        client.advance(duration)
+
+                with self.assertRaisesRegex(APIError, "joint") as error:
+                    client.fault("left", 0, Fault(status=9))
+                self.assertEqual(error.exception.status, 400)
+                with self.assertRaises(ValueError):
+                    client.push(Push(left=(float("nan"),) * 7))
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+if __name__ == "__main__":
+    unittest.main()

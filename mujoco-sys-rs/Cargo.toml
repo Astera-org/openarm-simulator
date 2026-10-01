@@ -1,0 +1,12 @@
+[package]
+name = "mujoco-sys-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+links = "mujoco"
+publish = false
+
+[build-dependencies]
+bindgen = "0.73"
+download-cache-rs = { path = "../download-cache-rs" }
+tempfile = "3"

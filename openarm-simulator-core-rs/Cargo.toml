@@ -1,0 +1,10 @@
+[package]
+name = "openarm-simulator-core-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+openarm-can-rs = { path = "../openarm-can-rs", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }

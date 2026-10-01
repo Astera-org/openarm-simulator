@@ -1,6 +1,6 @@
 [workspace]
-members = ["openarm-simulator", "openarm-simulator/tests/model"]
-default-members = ["openarm-simulator"]
+members = ["download-cache-rs", "mujoco-sys-rs", "mujoco-rs", "openarm-can-rs", "openarm-simulator-core-rs", "openarm-simulator-client-rs", "openarm-simulator-rs", "openarm-simulator-rs/tests/model"]
+default-members = ["openarm-simulator-rs"]
 resolver = "3"
 
 [profile.release]
