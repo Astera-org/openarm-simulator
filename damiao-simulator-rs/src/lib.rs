@@ -42,7 +42,7 @@ impl MotorConfig {
         }
         if ![self.ranges.pmax, self.ranges.vmax, self.ranges.tmax]
             .into_iter()
-            .all(|v| v.is_finite() && v > 0. && (v as f32).is_finite() && v as f32 > 0.)
+            .all(|v| v.is_finite() && v > 0.)
         {
             return Err(Error::InvalidMappingRange);
         }
@@ -107,14 +107,9 @@ impl Motor {
             damping: c.kd,
         }
     }
-    /// Create a disabled controller. Mapping settings use float32 register precision.
-    pub fn new(mut config: MotorConfig) -> Result<Self> {
+    /// Create a disabled controller.
+    pub fn new(config: MotorConfig) -> Result<Self> {
         config.validate()?;
-        config.ranges = MappingRanges {
-            pmax: f64::from(config.ranges.pmax as f32),
-            vmax: f64::from(config.ranges.vmax as f32),
-            tmax: f64::from(config.ranges.tmax as f32),
-        };
         Ok(Self {
             config,
             command: MitCommand::default(),
@@ -205,7 +200,7 @@ impl Motor {
                                 _ => &mut self.ranges.tmax,
                             };
                             // Damiao Write parameters: RAM writes take effect immediately.
-                            *range = f64::from(value);
+                            *range = value;
                         }
                         _ => return Err(Error::UnsupportedRegisterWrite(rid.0)),
                     }
@@ -215,9 +210,9 @@ impl Motor {
                     RegisterAddress::ESC_ID => u32::from(self.id()).to_le_bytes(),
                     RegisterAddress::TIMEOUT => SIMULATED_TIMEOUT.to_le_bytes(),
                     RegisterAddress::CTRL_MODE => (ControlMode::Mit as u32).to_le_bytes(),
-                    RegisterAddress::PMAX => (self.ranges.pmax as f32).to_le_bytes(),
-                    RegisterAddress::VMAX => (self.ranges.vmax as f32).to_le_bytes(),
-                    RegisterAddress::TMAX => (self.ranges.tmax as f32).to_le_bytes(),
+                    RegisterAddress::PMAX => self.ranges.pmax.to_le_bytes(),
+                    RegisterAddress::VMAX => self.ranges.vmax.to_le_bytes(),
+                    RegisterAddress::TMAX => self.ranges.tmax.to_le_bytes(),
                     _ => return Err(Error::UnsupportedRegisterRead(rid.0)),
                 };
                 // The reply is always eight bytes, even for a four-byte read request.
@@ -241,21 +236,22 @@ mod tests {
             id: 0x123,
             reply_id: 0x456,
             ranges: MappingRanges {
-                pmax: 8.,
+                pmax: 0.1,
                 vmax: 20.,
                 tmax: 5.,
             },
         };
         let mut motor = Motor::new(config).unwrap();
         for (register, expected) in [
-            (RegisterAddress::ESC_ID, 0x123u32),
-            (RegisterAddress::MST_ID, 0x456),
+            (RegisterAddress::ESC_ID, [0x23, 0x01, 0, 0]),
+            (RegisterAddress::MST_ID, [0x56, 0x04, 0, 0]),
+            (RegisterAddress::PMAX, [0xcd, 0xcc, 0xcc, 0x3d]),
         ] {
             let request = Request::ReadRegister(register)
                 .encode(config.id, config.ranges)
                 .unwrap();
             let response = motor.receive(request.id, request.data()).unwrap().unwrap();
-            assert_eq!(&response[4..], &expected.to_le_bytes());
+            assert_eq!(&response[4..], &expected);
         }
         assert_eq!(
             Feedback::decode(&motor.state().unwrap(), config.ranges)
@@ -269,15 +265,6 @@ mod tests {
         motor.silent = true;
         motor.reset();
         assert_eq!(motor, Motor::new(config).unwrap());
-        let normalized = Motor::new(MotorConfig {
-            ranges: MappingRanges {
-                pmax: 0.1,
-                ..config.ranges
-            },
-            ..config
-        })
-        .unwrap();
-        assert_eq!(normalized.ranges.pmax, f64::from(0.1f32));
         for invalid in [
             MotorConfig {
                 id: 0x7ff,
@@ -293,7 +280,7 @@ mod tests {
             },
             MotorConfig {
                 ranges: MappingRanges {
-                    pmax: f64::MAX,
+                    pmax: f32::INFINITY,
                     ..config.ranges
                 },
                 ..config
@@ -339,7 +326,7 @@ mod tests {
         assert_eq!(motor.torque, 0.);
     }
 
-    fn motor(id: u16, vmax: f64, tmax: f64) -> Motor {
+    fn motor(id: u16, vmax: f32, tmax: f32) -> Motor {
         Motor::new(MotorConfig {
             id,
             reply_id: id + 0x10,
@@ -356,7 +343,7 @@ mod tests {
     fn mapping_register_writes_change_command_and_feedback_scaling() {
         let mut motor = motor(7, 30., 10.);
         for (rid, value) in [
-            (RegisterAddress::PMAX, 7.5f32),
+            (RegisterAddress::PMAX, 0.1f32),
             (RegisterAddress::VMAX, 21.),
             (RegisterAddress::TMAX, 6.5),
         ] {
@@ -392,15 +379,15 @@ mod tests {
         assert_eq!(
             motor.ranges,
             MappingRanges {
-                pmax: 7.5,
+                pmax: 0.1,
                 vmax: 21.,
                 tmax: 6.5
             }
         );
         let command = MitCommand {
-            q: motor.ranges.pmax,
-            dq: motor.ranges.vmax,
-            tau: motor.ranges.tmax,
+            q: f64::from(motor.ranges.pmax),
+            dq: f64::from(motor.ranges.vmax),
+            tau: f64::from(motor.ranges.tmax),
             ..MitCommand::default()
         };
         let packet = Request::Mit(command).encode(7, motor.ranges).unwrap();

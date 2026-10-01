@@ -44,10 +44,9 @@ class ClientTest(unittest.TestCase):
 
         env = os.environ.copy()
         for key in (
-            "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDS_FIRST_FD", "OPENARM_SIMULATOR_CONFIG",
+            "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDS_FIRST_FD",
         ):
             env.pop(key, None)
-        env["OPENARM_SIMULATOR_CONFIG"] = str(repo / "openarm-simulator-rs/config/openarm-v1.json")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             listener.listen()
@@ -59,6 +58,7 @@ class ClientTest(unittest.TestCase):
                     'ip link add "$bus" type vcan; ip link set "$bus" mtu 72 up; '
                     'done; exec "$@"',
                     "namespace", binary, "--model", model,
+                    "--config", str(repo / "openarm-simulator-rs/config/openarm-v1.json"),
                     "--http-fd", str(listener.fileno()),
                 ],
                 pass_fds=(listener.fileno(),), stdout=subprocess.PIPE, text=True, env=env,

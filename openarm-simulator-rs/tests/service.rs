@@ -66,17 +66,12 @@ fn http_response(reader: &mut BufReader<TcpStream>, status: u16) -> Value {
     }
 }
 
-fn command() -> Command {
+fn command(config: &str) -> Command {
     let mut command = Command::new(BINARY);
-    for key in [
-        "LISTEN_FDS",
-        "LISTEN_PID",
-        "LISTEN_FDS_FIRST_FD",
-        "OPENARM_SIMULATOR_CONFIG",
-    ] {
+    for key in ["LISTEN_FDS", "LISTEN_PID", "LISTEN_FDS_FIRST_FD"] {
         command.env_remove(key);
     }
-    command.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG);
+    command.args(["--config", config]);
     command
 }
 
@@ -202,24 +197,27 @@ fn rejected(mut command: Command, fds: &[RawFd], reason: &str) {
 
 #[test]
 fn cli_and_invalid_descriptors() {
-    let help = command().arg("--help").output().unwrap();
+    let help = command(openarm_test_model::CONFIG)
+        .arg("--help")
+        .output()
+        .unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("--can-interface"));
     {
         let wrong = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
         let fd = wrong.as_raw_fd();
-        let mut cmd = command();
+        let mut cmd = command(openarm_test_model::CONFIG);
         cmd.args(["--model", "/unused", "--http-fd", &fd.to_string()]);
         rejected(cmd, &[fd], "TCP");
     }
     for fd in [0, 1, 2, 999_999] {
-        let mut cmd = command();
+        let mut cmd = command(openarm_test_model::CONFIG);
         cmd.args(["--model", "/unused", "--http-fd", &fd.to_string()]);
         rejected(cmd, &[], "descriptor");
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let fd = listener.as_raw_fd();
-    let mut cmd = command();
+    let mut cmd = command(openarm_test_model::CONFIG);
     cmd.args([
         "--model",
         "/unused",
@@ -242,7 +240,7 @@ fn host_listener_private_namespace() {
         cmd.args(["--user", "--map-root-user", "--net", "sh", "-ec",
             "ip link set lo up; ip link add rightbus type vcan; ip link set rightbus mtu 72 up; ip link add leftbus type vcan; ip link set leftbus mtu 72 up; exec \"$@\"", "namespace", BINARY,
             "--model", model, "--can-interface", "left=leftbus", "--can-interface", "right=rightbus", "--parent-fd", &lifetime.as_raw_fd().to_string()]);
-        cmd.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG)
+        cmd.args(["--config", openarm_test_model::CONFIG])
             .env_remove("LISTEN_FDS")
             .env_remove("LISTEN_PID");
         if activation {
@@ -308,7 +306,8 @@ fn realtime_can_motion() {
         return;
     }
     let model = openarm_test_model::SCENE;
-    let mut service = Running::start(command().args(["--model", model, "--port", "0"]));
+    let mut service =
+        Running::start(command(openarm_test_model::CONFIG).args(["--model", model, "--port", "0"]));
     let buses = ["can1", "can0"].map(|name| {
         let bus = CanFdSocket::open(name).unwrap();
         bus.set_read_timeout(Duration::from_secs(1)).unwrap();
@@ -380,7 +379,6 @@ fn can_http_and_lifecycle() {
         return;
     }
     let model = openarm_test_model::SCENE;
-    let directory = tempfile::tempdir().unwrap();
     // Default binds, all sockets inherited with custom names, and just one CAN fd.
     for mode in 0..3 {
         let names = if mode == 0 {
@@ -388,9 +386,8 @@ fn can_http_and_lifecycle() {
         } else {
             ["rightbus", "leftbus"]
         };
-        let mut cmd = command();
-        cmd.args(["--model", model, "--port", "0", "--report-dir"])
-            .arg(directory.path());
+        let mut cmd = command(openarm_test_model::CONFIG);
+        cmd.args(["--model", model, "--port", "0"]);
         if mode != 0 {
             cmd.args([
                 "--can-interface",
@@ -548,19 +545,15 @@ fn can_http_and_lifecycle() {
                     .is_some()
             );
         }
-        service.terminate();
-        let report: Value = serde_json::from_reader(
-            fs::File::open(directory.path().join("simulator.json")).unwrap(),
-        )
-        .unwrap();
         assert_eq!(
-            report["timestep_ns"],
+            service.get("/state")["timestep_ns"],
             configuration["configuration"]["timestep_ns"]
         );
+        service.terminate();
     }
     // Independent parent lifetime descriptor.
     let (parent, lifetime) = UnixStream::pair().unwrap();
-    let mut cmd = command();
+    let mut cmd = command(openarm_test_model::CONFIG);
     cmd.args([
         "--model",
         model,
@@ -595,7 +588,7 @@ fn reject_bad_can(model: &str) {
         (unbound.as_raw_fd(), buses[1].as_raw_fd(), "must be bound"),
         (buses[0].as_raw_fd(), buses[0].as_raw_fd(), "distinct"),
     ] {
-        let mut cmd = command();
+        let mut cmd = command(openarm_test_model::CONFIG);
         cmd.args([
             "--model",
             model,
@@ -609,10 +602,10 @@ fn reject_bad_can(model: &str) {
         rejected(cmd, &[right, left], reason);
     }
     let mut foreign = Command::new("unshare");
-    foreign.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG);
     foreign.args(["--user", "--map-root-user", "--net", "sh", "-ec",
         "for bus in can0 can1; do ip link add \"$bus\" type vcan; ip link set \"$bus\" mtu 72 up; done; exec \"$@\"", "namespace", BINARY,
         "--model", model, "--port", "0", "--host", "0.0.0.0", "--can-fd", &format!("right={}", buses[0].as_raw_fd()), "--can-fd", &format!("left={}", buses[1].as_raw_fd())]);
+    foreign.args(["--config", openarm_test_model::CONFIG]);
     rejected(
         foreign,
         &[buses[0].as_raw_fd(), buses[1].as_raw_fd()],
@@ -624,7 +617,7 @@ fn reject_bad_can(model: &str) {
         ["can0", "can0"],
         ["missing", "can1"],
     ] {
-        let mut cmd = command();
+        let mut cmd = command(openarm_test_model::CONFIG);
         cmd.args([
             "--model",
             model,
@@ -660,22 +653,19 @@ fn clock_start_reset_and_fixed_updates() {
     let mut settings: Value =
         serde_json::from_str(&fs::read_to_string(openarm_test_model::CONFIG).unwrap()).unwrap();
     settings["timestep_ns"] = json!(period);
-    settings["positions"]["openarm_left_joint7"] = json!(0.25);
     fs::write(&config, settings.to_string()).unwrap();
-    let mut service = Running::start(command().args([
+    let mut service = Running::start(command(config.to_str().unwrap()).args([
         "--model",
         openarm_test_model::SCENE,
         "--port",
         "0",
-        "--config",
-        config.to_str().unwrap(),
     ]));
     let initial = service.get("/state");
     assert_eq!(initial["paused"], true);
     assert_eq!(initial["advancing"], false);
     assert_eq!(initial["time_ns"], 0);
     assert_eq!(initial["timestep_ns"], period);
-    assert_eq!(initial["state"]["left_joint7"]["q"], 0.25);
+    assert_eq!(initial["state"]["left_joint7"]["q"], 0.);
     thread::sleep(Duration::from_millis(20));
     assert_eq!(service.get("/state"), initial);
     service.clock("/pause", 204);
@@ -763,8 +753,12 @@ fn can_batches_between_advances_and_accelerated_motion() {
     if !in_can_namespace("can_batches_between_advances_and_accelerated_motion") {
         return;
     }
-    let mut service =
-        Running::start(command().args(["--model", openarm_test_model::SCENE, "--port", "0"]));
+    let mut service = Running::start(command(openarm_test_model::CONFIG).args([
+        "--model",
+        openarm_test_model::SCENE,
+        "--port",
+        "0",
+    ]));
     let bus = client_bus("can1", 0x17);
     service.advance(0);
     let initial = service.get("/state");
@@ -839,8 +833,12 @@ fn can_and_shutdown_remain_live_during_advance() {
     if !in_can_namespace("can_and_shutdown_remain_live_during_advance") {
         return;
     }
-    let mut service =
-        Running::start(command().args(["--model", openarm_test_model::SCENE, "--port", "0"]));
+    let mut service = Running::start(command(openarm_test_model::CONFIG).args([
+        "--model",
+        openarm_test_model::SCENE,
+        "--port",
+        "0",
+    ]));
     // Keep an advance pending, then shut down deliberately. No arbitrary maximum
     // duration, integration batch limit, or sleeping to manufacture an overlap.
     let mut advance = TcpStream::connect(service.1).unwrap();
@@ -882,8 +880,12 @@ fn full_can_transmit_queue_rejects_writes_and_simulator_replies() {
     }
     // Starting the simulator verifies these are vcan interfaces before we
     // change any queue. The test runs in its own disposable network namespace.
-    let mut service =
-        Running::start(command().args(["--model", openarm_test_model::SCENE, "--port", "0"]));
+    let mut service = Running::start(command(openarm_test_model::CONFIG).args([
+        "--model",
+        openarm_test_model::SCENE,
+        "--port",
+        "0",
+    ]));
     let bus = client_bus("can1", 0x17);
     let filler = CanFdSocket::open("can1").unwrap();
     filler.set_filter_drop_all().unwrap();
@@ -962,8 +964,12 @@ fn can_client_codec_and_socket_errors() {
         return;
     }
     use damiao_can_rs::{ControlMode, Feedback, MappingRanges, MotorStatus, Request};
-    let mut service =
-        Running::start(command().args(["--model", openarm_test_model::SCENE, "--port", "0"]));
+    let mut service = Running::start(command(openarm_test_model::CONFIG).args([
+        "--model",
+        openarm_test_model::SCENE,
+        "--port",
+        "0",
+    ]));
     let bus = client_bus("can1", 0x17);
     // An empty blocking read with a timeout must be reported, not a valid frame.
     bus.set_read_timeout(Duration::from_millis(10)).unwrap();
@@ -1039,15 +1045,8 @@ fn configured_motor_addresses_bindings_and_reset() {
     }});
     let settings = json!({"buses":{"bench":"can0"}, "motors":{"tool":binding}});
     fs::write(&config, serde_json::to_vec(&settings).unwrap()).unwrap();
-    let mut cmd = command();
-    cmd.args([
-        "--model",
-        openarm_test_model::SCENE,
-        "--config",
-        config.to_str().unwrap(),
-        "--port",
-        "0",
-    ]);
+    let mut cmd = command(config.to_str().unwrap());
+    cmd.args(["--model", openarm_test_model::SCENE, "--port", "0"]);
     let mut service = Running::start(&mut cmd);
     let initial = service.get("/state");
     assert_eq!(initial["state"].as_object().unwrap().len(), 1);
@@ -1075,15 +1074,8 @@ fn configured_motor_addresses_bindings_and_reset() {
         let mut invalid = settings.clone();
         invalid["motors"] = replacement;
         fs::write(&config, serde_json::to_vec(&invalid).unwrap()).unwrap();
-        let mut cmd = command();
-        cmd.args([
-            "--model",
-            openarm_test_model::SCENE,
-            "--config",
-            config.to_str().unwrap(),
-            "--port",
-            "0",
-        ]);
+        let mut cmd = command(config.to_str().unwrap());
+        cmd.args(["--model", openarm_test_model::SCENE, "--port", "0"]);
         assert!(!cmd.output().unwrap().status.success());
     }
 }

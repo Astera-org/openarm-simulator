@@ -27,7 +27,6 @@ pub struct Physics {
     model: Model,
     data: Data,
     actuators: Vec<Actuator>,
-    initial_positions: Vec<(usize, f64)>,
     pub timestep_ns: u64,
     friction: Vec<VariableFriction>,
     joint_parameters: BTreeMap<String, JointParameters>,
@@ -171,19 +170,12 @@ impl Physics {
                 },
             );
         }
-        let mut initial_positions = Vec::new();
-        for (name, value) in &config.positions {
-            ensure!(value.is_finite(), "startup position must be finite: {name}");
-            let (_, qpos, _) = scalar_joint(&model, name)?;
-            initial_positions.push((qpos, *value));
-        }
         let mut data = Data::new(&model)?;
         model.set_constants(&mut data);
         let mut physics = Self {
             model,
             data,
             actuators,
-            initial_positions,
             timestep_ns: config.timestep_ns,
             friction,
             joint_parameters,
@@ -195,9 +187,6 @@ impl Physics {
 
     pub fn reset(&mut self) -> Result<()> {
         self.model.reset_data(&mut self.data);
-        for (qpos, position) in &self.initial_positions {
-            self.data.view_mut().qpos[*qpos] = *position;
-        }
         self.applied_torque.clear();
         self.configure(&vec![Drive::default(); self.actuators.len()])?;
         self.configure_friction();
@@ -359,17 +348,20 @@ mod tests {
     fn profile() -> Config {
         serde_json::from_str(include_str!("../config/openarm-v1.json")).unwrap()
     }
-    fn positions(right: [f64; 8], left: [f64; 8]) -> BTreeMap<String, f64> {
-        let mut positions = BTreeMap::new();
+    fn set_pose(sim: &mut Simulation, right: [f64; 8], left: [f64; 8]) {
         for (side, pose) in [("right", right), ("left", left)] {
             for (j, q) in pose[..7].iter().enumerate() {
-                positions.insert(format!("openarm_{side}_joint{}", j + 1), *q);
+                let name = format!("openarm_{side}_joint{}", j + 1);
+                let (_, qpos, _) = scalar_joint(&sim.physics.model, &name).unwrap();
+                sim.physics.data.view_mut().qpos[qpos] = *q;
             }
             for j in 1..=2 {
-                positions.insert(format!("openarm_{side}_finger_joint{j}"), -pose[7] * RADIUS);
+                let name = format!("openarm_{side}_finger_joint{j}");
+                let (_, qpos, _) = scalar_joint(&sim.physics.model, &name).unwrap();
+                sim.physics.data.view_mut().qpos[qpos] = -pose[7] * RADIUS;
             }
         }
-        positions
+        sim.step(0).unwrap();
     }
     fn torques(values: [[f64; 7]; 2]) -> Push {
         ["right", "left"]
@@ -391,9 +383,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scene.xml");
         std::fs::write(&path, r#"<mujoco>
+          <compiler angle="radian"/>
           <option gravity="0 0 0" integrator="implicitfast"/>
           <worldbody>
-            <body name="tool"><joint name="hinge" damping="0.2"/><geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="1"/></body>
+            <body name="tool"><joint name="hinge" ref="0.2" damping="0.2"/><geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="1"/></body>
             <body name="extra" pos="2 0 0"><joint name="passive"/><geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="1"/></body>
             <body pos="4 0 0"><freejoint name="floating"/><geom type="sphere" size="0.1" mass="1"/></body>
           </worldbody>
@@ -404,7 +397,6 @@ mod tests {
         </mujoco>"#).unwrap();
         let config: Config = serde_json::from_value(serde_json::json!({
             "buses":{"bench":"vcan9"},
-            "positions":{"hinge":0.2},
             "bodies":{"tool":{"mass":2.,"com":[0.1,0.,0.],"inertia":[0.001,0.01,0.01]}},
             "motors":{"tool_motor":{"bus":"bench","actuator":"shaft","encoder_offset_rad":0.4,
                 "controller":{"id":75,"reply_id":150,"ranges":{"pmax":12.5,"vmax":30.,"tmax":10.}}}}
@@ -461,13 +453,12 @@ mod tests {
         let mut pose = [0.; 8];
         pose[3] = 45f64.to_radians();
         pose[7] = -0.2;
-        let mut p = world(Config {
-            positions: positions(pose, pose),
-            ..profile()
-        });
+        let mut p = world(profile());
+        set_pose(&mut p, pose, pose);
         p.step(200).unwrap();
         assert!((p.motors[11].q - pose[3]).abs() > 0.001);
         p.reset().unwrap();
+        set_pose(&mut p, pose, pose);
         for m in &mut p.motors {
             m.status = MotorStatus::ENABLED;
             m.command = MitCommand {
@@ -802,10 +793,8 @@ mod tests {
     fn arms_share_contact_world() {
         let right = [-26.625f64, 1.814, -56.701, 121.279, 0., 0., 0., -10.].map(f64::to_radians);
         let left = [-69.152f64, -4.847, -72.3, 115.939, 0., 0., 0., -10.].map(f64::to_radians);
-        let p = world(Config {
-            positions: positions(right, left),
-            ..profile()
-        });
+        let mut p = world(profile());
+        set_pose(&mut p, right, left);
         let hit = p.physics.data.contacts().iter().any(|c| {
             let a = p
                 .physics

@@ -212,11 +212,5 @@
         }
       }
     }
-  },
-  "positions": {
-    "openarm_left_finger_joint1": 0.007333316184850124,
-    "openarm_left_finger_joint2": 0.007333316184850124,
-    "openarm_right_finger_joint1": 0.007333316184850124,
-    "openarm_right_finger_joint2": 0.007333316184850124
   }
 }

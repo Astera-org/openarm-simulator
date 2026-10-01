@@ -58,15 +58,10 @@ fn control_api_against_simulator() {
     command.args(["--user", "--map-root-user", "--net", "sh", "-ec",
         "ip link set lo up; for bus in can0 can1; do ip link add \"$bus\" type vcan; ip link set \"$bus\" mtu 72 up; done; exec \"$@\"",
         "namespace", &binary, "--model", openarm_test_model::SCENE, "--http-fd", &fd.to_string()]);
-    for key in [
-        "LISTEN_FDS",
-        "LISTEN_PID",
-        "LISTEN_FDS_FIRST_FD",
-        "OPENARM_SIMULATOR_CONFIG",
-    ] {
+    for key in ["LISTEN_FDS", "LISTEN_PID", "LISTEN_FDS_FIRST_FD"] {
         command.env_remove(key);
     }
-    command.env("OPENARM_SIMULATOR_CONFIG", openarm_test_model::CONFIG);
+    command.args(["--config", openarm_test_model::CONFIG]);
     unsafe {
         command.pre_exec(move || {
             let flags = libc::fcntl(fd, libc::F_GETFD);

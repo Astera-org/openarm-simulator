@@ -403,7 +403,7 @@ pub fn run(
     sockets: Vec<CanFdSocket>,
     parent: Option<OwnedFd>,
     stopped: &AtomicBool,
-) -> Result<State> {
+) -> Result<()> {
     let timer = Timer::new()?;
     let mut clock = Clock::default();
     let timestep_ns = physics.physics.timestep_ns;
@@ -565,13 +565,7 @@ pub fn run(
             "simulator descriptor failed"
         );
     }
-    Ok(snapshot(
-        physics,
-        processed_time_ns,
-        clock.paused(),
-        false,
-        &stats,
-    ))
+    Ok(())
 }
 
 #[cfg(test)]

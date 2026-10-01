@@ -11,8 +11,6 @@ pub struct Config {
     pub buses: BTreeMap<String, String>,
     pub motors: BTreeMap<String, MotorBinding>,
     pub timestep_ns: u64,
-    /// Startup positions of named hinge/slide joints, in radians/metres.
-    pub positions: BTreeMap<String, f64>,
     pub bodies: BTreeMap<String, BodyParameters>,
     pub joints: BTreeMap<String, JointParameters>,
     pub friction_scale: f64,
@@ -24,7 +22,6 @@ impl Default for Config {
             buses: BTreeMap::new(),
             motors: BTreeMap::new(),
             timestep_ns: DEFAULT_TIMESTEP_NS,
-            positions: BTreeMap::new(),
             bodies: BTreeMap::new(),
             joints: BTreeMap::new(),
             friction_scale: 1.,

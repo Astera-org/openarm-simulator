@@ -26,7 +26,6 @@ use std::{
     after_help = "Motor commands use CAN only. Supply --config with named buses and motors; see config/openarm-v1.json for the OpenArm setup and models/openarm-v1.xml for its shaft transmissions. A binding's actuator transmission length represents shaft angle in radians. HTTP: GET /state, GET /configuration, POST /fault, /push, /reset, /pause, /unpause, /advance.\nClock starts paused; reset restores startup state and pauses. POST /advance accepts {\"duration_ns\": <integer>} while paused. Clock mutations return empty 200 responses, or 204 for an unchanged pause/unpause; 409 means clock state conflict.\nInherited descriptors must survive exec. HTTP also accepts LISTEN_FDS=1, LISTEN_PID, and LISTEN_FDS_FIRST_FD (default 3).\nBuild: cargo build --release (downloads pinned MuJoCo unless MUJOCO_DIR is set).\nTests: cargo test (also provisions the pinned model; requires Linux user/network namespaces, vcan and iproute2)."
 )]
 struct Args {
-    /// External MJCF scene, including its referenced meshes
     #[arg(long, env = "OPENARM_SIMULATOR_MODEL")]
     model: PathBuf,
     #[arg(long, default_value = "127.0.0.1")]
@@ -45,12 +44,8 @@ struct Args {
     /// Readable pipe/socket; EOF stops the simulator
     #[arg(long)]
     parent_fd: Option<RawFd>,
-    /// Startup JSON: buses, named motors, timestep_ns, positions, bodies, joints, friction_scale
-    #[arg(long, env = "OPENARM_SIMULATOR_CONFIG")]
-    config: Option<PathBuf>,
-    /// Write simulator.json on shutdown
     #[arg(long)]
-    report_dir: Option<PathBuf>,
+    config: Option<PathBuf>,
 }
 
 fn assignment(value: &str) -> std::result::Result<(String, String), String> {
@@ -129,15 +124,8 @@ fn main() -> Result<()> {
     http::start(listener, control)?;
     println!("HTTP administration: http://{address}");
     std::io::stdout().flush()?;
-    let state = service::run(&mut physics, calls, buses, parent, &stopped)?;
+    service::run(&mut physics, calls, buses, parent, &stopped)?;
 
-    if let Some(directory) = args.report_dir {
-        fs::create_dir_all(&directory)?;
-        fs::write(
-            directory.join("simulator.json"),
-            serde_json::to_vec_pretty(&state)?,
-        )?;
-    }
     Ok(())
 }
 
@@ -152,7 +140,12 @@ mod tests {
         let path = dir.path().join("plant.json");
         fs::write(&path, "{\"joints\":{}}").unwrap();
         assert_eq!(configuration(Some(&path)).unwrap().friction_scale, 1.);
-        for value in ["[]", "{\"unknown\":1}", "{\"friction_scale\":NaN}"] {
+        for value in [
+            "[]",
+            "{\"unknown\":1}",
+            "{\"positions\":{\"joint\":0.25}}",
+            "{\"friction_scale\":NaN}",
+        ] {
             fs::write(&path, value).unwrap();
             assert!(configuration(Some(&path)).is_err());
         }

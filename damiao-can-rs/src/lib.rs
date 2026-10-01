@@ -124,24 +124,23 @@ pub struct MitCommand {
 }
 
 /// Scaling settings for MIT commands and feedback in every control mode.
-/// Must match the motor's PMAX/VMAX/TMAX registers; each value must be positive
-/// and at most `f64::MAX / 2`.
+/// Must match the motor's PMAX/VMAX/TMAX registers; each value must be positive and finite.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct MappingRanges {
     /// PMAX setting, in radians.
-    pub pmax: f64,
+    pub pmax: f32,
     /// VMAX setting, in radians/second.
-    pub vmax: f64,
+    pub vmax: f32,
     /// TMAX setting, in newton-metres.
-    pub tmax: f64,
+    pub tmax: f32,
 }
 
 impl MappingRanges {
     fn validate(self) -> Result<(), Error> {
         if [self.pmax, self.vmax, self.tmax]
             .iter()
-            .all(|x| x.is_finite() && *x > 0. && (2. * x).is_finite())
+            .all(|x| x.is_finite() && *x > 0.)
         {
             Ok(())
         } else {
@@ -166,15 +165,16 @@ impl MitCommand {
     /// Rejects commands that would trigger a different motor operation.
     pub fn encode(self, ranges: MappingRanges) -> Result<[u8; 8], Error> {
         ranges.validate()?;
+        let [pmax, vmax, tmax] = [ranges.pmax, ranges.vmax, ranges.tmax].map(f64::from);
         if ![self.q, self.dq, self.tau, self.kp, self.kd]
             .iter()
             .all(|x| x.is_finite())
         {
             return Err(Error::NonFiniteCommand);
         }
-        let q = pack(self.q, -ranges.pmax, ranges.pmax, POSITION_BITS);
-        let dq = pack(self.dq, -ranges.vmax, ranges.vmax, MIT_FIELD_BITS);
-        let tau = pack(self.tau, -ranges.tmax, ranges.tmax, MIT_FIELD_BITS);
+        let q = pack(self.q, -pmax, pmax, POSITION_BITS);
+        let dq = pack(self.dq, -vmax, vmax, MIT_FIELD_BITS);
+        let tau = pack(self.tau, -tmax, tmax, MIT_FIELD_BITS);
         let kp = pack(self.kp, 0., MIT_KP_MAX, MIT_FIELD_BITS);
         let kd = pack(self.kd, 0., MIT_KD_MAX, MIT_FIELD_BITS);
         let data = [
@@ -203,23 +203,14 @@ impl MitCommand {
             return Err(Error::ReservedMotorOperation);
         }
         ranges.validate()?;
+        let [pmax, vmax, tmax] = [ranges.pmax, ranges.vmax, ranges.tmax].map(f64::from);
         let b: [u32; 8] = std::array::from_fn(|i| data[i] as u32);
         Ok(Self {
-            q: unpack(b[0] << 8 | b[1], -ranges.pmax, ranges.pmax, POSITION_BITS),
-            dq: unpack(
-                b[2] << 4 | b[3] >> 4,
-                -ranges.vmax,
-                ranges.vmax,
-                MIT_FIELD_BITS,
-            ),
+            q: unpack(b[0] << 8 | b[1], -pmax, pmax, POSITION_BITS),
+            dq: unpack(b[2] << 4 | b[3] >> 4, -vmax, vmax, MIT_FIELD_BITS),
             kp: unpack((b[3] & 15) << 8 | b[4], 0., MIT_KP_MAX, MIT_FIELD_BITS),
             kd: unpack(b[5] << 4 | b[6] >> 4, 0., MIT_KD_MAX, MIT_FIELD_BITS),
-            tau: unpack(
-                (b[6] & 15) << 8 | b[7],
-                -ranges.tmax,
-                ranges.tmax,
-                MIT_FIELD_BITS,
-            ),
+            tau: unpack((b[6] & 15) << 8 | b[7], -tmax, tmax, MIT_FIELD_BITS),
         })
     }
 }
@@ -545,15 +536,16 @@ impl Feedback {
     /// Measurements outside the configured limits are reported at those limits.
     pub fn encode(self, ranges: MappingRanges) -> Result<[u8; 8], Error> {
         ranges.validate()?;
+        let [pmax, vmax, tmax] = [ranges.pmax, ranges.vmax, ranges.tmax].map(f64::from);
         if self.reported_id >= 16
             || self.status.0 >= 16
             || ![self.q, self.dq, self.torque].iter().all(|x| x.is_finite())
         {
             return Err(Error::InvalidFeedback);
         }
-        let q = pack(self.q, -ranges.pmax, ranges.pmax, POSITION_BITS);
-        let v = pack(self.dq, -ranges.vmax, ranges.vmax, MIT_FIELD_BITS);
-        let t = pack(self.torque, -ranges.tmax, ranges.tmax, MIT_FIELD_BITS);
+        let q = pack(self.q, -pmax, pmax, POSITION_BITS);
+        let v = pack(self.dq, -vmax, vmax, MIT_FIELD_BITS);
+        let t = pack(self.torque, -tmax, tmax, MIT_FIELD_BITS);
         Ok([
             self.reported_id | self.status.0 << 4,
             (q >> 8) as u8,
@@ -573,24 +565,25 @@ impl Feedback {
             return Err(Error::InvalidLength);
         }
         ranges.validate()?;
+        let [pmax, vmax, tmax] = [ranges.pmax, ranges.vmax, ranges.tmax].map(f64::from);
         Ok(Self {
             reported_id: data[0] & 15,
             q: unpack(
                 u16::from_be_bytes([data[1], data[2]]).into(),
-                -ranges.pmax,
-                ranges.pmax,
+                -pmax,
+                pmax,
                 POSITION_BITS,
             ),
             dq: unpack(
                 (data[3] as u32) << 4 | (data[4] as u32) >> 4,
-                -ranges.vmax,
-                ranges.vmax,
+                -vmax,
+                vmax,
                 MIT_FIELD_BITS,
             ),
             torque: unpack(
                 ((data[4] & 15) as u32) << 8 | data[5] as u32,
-                -ranges.tmax,
-                ranges.tmax,
+                -tmax,
+                tmax,
                 MIT_FIELD_BITS,
             ),
             status: MotorStatus(data[0] >> 4),
@@ -827,7 +820,7 @@ mod tests {
     #[test]
     fn non_mit_commands_do_not_depend_on_mapping_ranges() {
         let invalid_ranges = MappingRanges {
-            pmax: f64::NAN,
+            pmax: f32::NAN,
             vmax: 0.,
             tmax: -1.,
         };
@@ -1026,9 +1019,9 @@ mod tests {
         let ranges = DM4310_DEFAULT_MAPPING_RANGES;
         for (factor, bytes) in [(-2., [0; 8]), (2., [0xff; 8])] {
             let command = MitCommand {
-                q: factor * ranges.pmax,
-                dq: factor * ranges.vmax,
-                tau: factor * ranges.tmax,
+                q: factor * f64::from(ranges.pmax),
+                dq: factor * f64::from(ranges.vmax),
+                tau: factor * f64::from(ranges.tmax),
                 kp: factor * MIT_KP_MAX,
                 kd: factor * MIT_KD_MAX,
             };
@@ -1045,9 +1038,9 @@ mod tests {
             tmax: 3.,
         };
         let command = MitCommand {
-            q: -ranges.pmax,
-            dq: ranges.vmax,
-            tau: -ranges.tmax,
+            q: -f64::from(ranges.pmax),
+            dq: f64::from(ranges.vmax),
+            tau: -f64::from(ranges.tmax),
             ..MitCommand::default()
         };
         let bytes = [0x00, 0x00, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00];
@@ -1072,9 +1065,9 @@ mod tests {
         let command = MitCommand::decode(&bytes, ranges).unwrap();
         // Symmetric signed ranges have no exact zero code. These tiny negative
         // values are expected resolution loss, not a sign or offset bug.
-        assert!((command.q + ranges.pmax / 65535.).abs() < 1e-12);
-        assert!((command.dq + ranges.vmax / 4095.).abs() < 1e-12);
-        assert!((command.tau + ranges.tmax / 4095.).abs() < 1e-12);
+        assert!((command.q + f64::from(ranges.pmax) / 65535.).abs() < 1e-12);
+        assert!((command.dq + f64::from(ranges.vmax) / 4095.).abs() < 1e-12);
+        assert!((command.tau + f64::from(ranges.tmax) / 4095.).abs() < 1e-12);
     }
 
     #[test]
@@ -1185,9 +1178,9 @@ mod tests {
         ] {
             let feedback = Feedback {
                 reported_id: 7,
-                q: factor * ranges.pmax,
-                dq: factor * ranges.vmax,
-                torque: factor * ranges.tmax,
+                q: factor * f64::from(ranges.pmax),
+                dq: factor * f64::from(ranges.vmax),
+                torque: factor * f64::from(ranges.tmax),
                 status: MotorStatus::DISABLED,
                 mos_temperature: 0,
                 rotor_temperature: 0,
@@ -1205,9 +1198,9 @@ mod tests {
         };
         let feedback = Feedback {
             reported_id: 7,
-            q: ranges.pmax,
-            dq: -ranges.vmax,
-            torque: ranges.tmax,
+            q: f64::from(ranges.pmax),
+            dq: -f64::from(ranges.vmax),
+            torque: f64::from(ranges.tmax),
             status: MotorStatus::DISABLED,
             mos_temperature: 0,
             rotor_temperature: 0,
@@ -1283,17 +1276,9 @@ mod tests {
     }
 
     #[test]
-    fn mapping_ranges_require_positive_finite_spans_in_every_field() {
+    fn mapping_ranges_require_positive_finite_registers_in_every_field() {
         let valid = DM4310_DEFAULT_MAPPING_RANGES;
-        // f64::MAX itself is finite, but the signed span (-max..max) overflows.
-        for value in [
-            0.,
-            -1.,
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::MAX,
-        ] {
+        for value in [0., -1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             for ranges in [
                 MappingRanges {
                     pmax: value,
@@ -1310,6 +1295,22 @@ mod tests {
             ] {
                 assert_eq!(ranges.validate(), Err(Error::InvalidRanges), "{ranges:?}");
             }
+        }
+        for value in [f32::from_bits(1), f32::MAX] {
+            let ranges = MappingRanges {
+                pmax: value,
+                vmax: value,
+                tmax: value,
+            };
+            let command = MitCommand {
+                q: f64::from(value),
+                dq: f64::from(value),
+                tau: f64::from(value),
+                ..MitCommand::default()
+            };
+            let bytes = [0xff, 0xff, 0xff, 0xf0, 0, 0, 0x0f, 0xff];
+            assert_eq!(command.encode(ranges), Ok(bytes));
+            assert_eq!(MitCommand::decode(&bytes, ranges), Ok(command));
         }
     }
 
@@ -1358,9 +1359,9 @@ mod tests {
     fn mit_request_encode_uses_the_motor_can_id() {
         let ranges = DM4310_DEFAULT_MAPPING_RANGES;
         let command = MitCommand {
-            q: -ranges.pmax,
-            dq: -ranges.vmax,
-            tau: -ranges.tmax,
+            q: -f64::from(ranges.pmax),
+            dq: -f64::from(ranges.vmax),
+            tau: -f64::from(ranges.tmax),
             ..MitCommand::default()
         };
         assert_eq!(
@@ -1373,9 +1374,9 @@ mod tests {
     fn mit_request_decode_returns_the_motion_command() {
         let ranges = DM4310_DEFAULT_MAPPING_RANGES;
         let command = MitCommand {
-            q: -ranges.pmax,
-            dq: -ranges.vmax,
-            tau: -ranges.tmax,
+            q: -f64::from(ranges.pmax),
+            dq: -f64::from(ranges.vmax),
+            tau: -f64::from(ranges.tmax),
             ..MitCommand::default()
         };
         assert_eq!(
@@ -1448,12 +1449,13 @@ mod tests {
             // Seven ff bytes plus one of these torque tails means a motor operation.
             // Use the middle of that torque bin so roundoff cannot change its code.
             let command = MitCommand {
-                q: ranges.pmax,
-                dq: ranges.vmax,
+                q: f64::from(ranges.pmax),
+                dq: f64::from(ranges.vmax),
                 kp: MIT_KP_MAX,
                 kd: MIT_KD_MAX,
-                tau: (f64::from(0xf00 + u16::from(opcode)) + 0.5) / 4095. * (2. * ranges.tmax)
-                    - ranges.tmax,
+                tau: (f64::from(0xf00 + u16::from(opcode)) + 0.5) / 4095.
+                    * (2. * f64::from(ranges.tmax))
+                    - f64::from(ranges.tmax),
             };
             assert_eq!(command.encode(ranges), Err(Error::ReservedMotorOperation));
             assert_eq!(
@@ -1478,9 +1480,9 @@ mod tests {
     fn all_ff_is_a_valid_maximum_motion_command() {
         let ranges = DM4310_DEFAULT_MAPPING_RANGES;
         let command = MitCommand {
-            q: ranges.pmax,
-            dq: ranges.vmax,
-            tau: ranges.tmax,
+            q: f64::from(ranges.pmax),
+            dq: f64::from(ranges.vmax),
+            tau: f64::from(ranges.tmax),
             kp: MIT_KP_MAX,
             kd: MIT_KD_MAX,
         };
