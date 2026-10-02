@@ -244,8 +244,6 @@ pub struct State {
     pub plant: Plant,
     /// Body states in MuJoCo index order, including unnamed bodies and world at index zero.
     pub bodies: Vec<BodyState>,
-    /// Site states in MuJoCo index order, including unnamed sites.
-    pub sites: Vec<SiteState>,
     pub springs: BTreeMap<String, SpringState>,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]

@@ -1,63 +1,17 @@
 use super::*;
 
-/// Borrow a site's current kinematics. Quaternions use wxyz order.
-pub struct Site<'a> {
+/// Borrow a body's world pose and centre of mass. Quaternions use wxyz order.
+pub struct Body<'a> {
     model: &'a ffi::mjModel,
     data: &'a ffi::mjData,
     index: usize,
 }
-impl<'a> Site<'a> {
+impl<'a> Body<'a> {
     fn new(model: &'a ffi::mjModel, data: &'a ffi::mjData, index: usize) -> Self {
-        assert!(index < model.nsite as usize);
+        assert!(index < model.nbody as usize);
         Self { model, data, index }
     }
 
-    pub fn body(&self) -> BodyIndex {
-        unsafe { BodyIndex(*self.model.site_bodyid.add(self.index) as usize) }
-    }
-
-    pub fn position(&self) -> &[f64; 3] {
-        unsafe {
-            slice_ref(self.data.site_xpos.add(3 * self.index), 3)
-                .try_into()
-                .unwrap()
-        }
-    }
-
-    pub fn orientation(&self) -> [f64; 4] {
-        let mut quaternion = [0.; 4];
-        unsafe {
-            ffi::mju_mat2Quat(
-                quaternion.as_mut_ptr(),
-                self.data.site_xmat.add(9 * self.index),
-            );
-        }
-        quaternion
-    }
-
-    /// Read the site's linear velocity in world axes.
-    pub fn velocity(&self) -> [f64; 3] {
-        let mut velocity = [0.; 6];
-        unsafe {
-            ffi::mj_objectVelocity(
-                self.model,
-                self.data,
-                ffi::mjOBJ_SITE as i32,
-                self.index as i32,
-                velocity.as_mut_ptr(),
-                0,
-            );
-        }
-        velocity[3..].try_into().unwrap()
-    }
-}
-
-/// Borrow a body's world pose and centre of mass. Quaternions use wxyz order.
-pub struct Body<'a> {
-    data: &'a ffi::mjData,
-    index: usize,
-}
-impl Body<'_> {
     pub fn position(&self) -> &[f64; 3] {
         unsafe {
             slice_ref(self.data.xpos.add(3 * self.index), 3)
@@ -81,9 +35,55 @@ impl Body<'_> {
                 .unwrap()
         }
     }
+
+    /// Locate a body-local point in world coordinates.
+    pub fn point_position(&self, local: [f64; 3]) -> [f64; 3] {
+        let offset = self.world_offset(local);
+        std::array::from_fn(|i| self.position()[i] + offset[i])
+    }
+
+    /// Read a body-local point's linear velocity in world axes.
+    pub fn point_velocity(&self, local: [f64; 3]) -> [f64; 3] {
+        let offset = self.world_offset(local);
+        let mut velocity = [0.; 6];
+        unsafe {
+            ffi::mj_objectVelocity(
+                self.model,
+                self.data,
+                ffi::mjOBJ_XBODY as i32,
+                self.index as i32,
+                velocity.as_mut_ptr(),
+                0,
+            );
+        }
+        std::array::from_fn(|i| {
+            let j = (i + 1) % 3;
+            let k = (i + 2) % 3;
+            velocity[3 + i] + velocity[j] * offset[k] - velocity[k] * offset[j]
+        })
+    }
+
+    fn world_offset(&self, local: [f64; 3]) -> [f64; 3] {
+        let rotation = unsafe { slice_ref(self.data.xmat.add(9 * self.index), 9) };
+        std::array::from_fn(|i| (0..3).map(|j| rotation[3 * i + j] * local[j]).sum())
+    }
 }
 
 impl Model {
+    /// Locate a site's attachment in its body's local frame. Panics if the index is out of range.
+    pub fn site_point(&self, index: SiteIndex) -> (BodyIndex, [f64; 3]) {
+        assert!(index.0 < self.count::<SiteIndex>());
+        unsafe {
+            let model = self.raw.as_ref();
+            (
+                BodyIndex(*model.site_bodyid.add(index.0) as usize),
+                slice_ref(model.site_pos.add(3 * index.0), 3)
+                    .try_into()
+                    .unwrap(),
+            )
+        }
+    }
+
     pub fn count<I: ObjectIndex>(&self) -> usize {
         let m = unsafe { self.raw.as_ref() };
         (match I::OBJECT {
@@ -105,17 +105,7 @@ impl Model {
     /// Observe a body after forward dynamics. Panics if the index is out of range.
     pub fn body<'a>(&'a self, data: &'a Data, index: BodyIndex) -> Body<'a> {
         self.check_data(data);
-        assert!(index.0 < self.count::<BodyIndex>());
-        Body {
-            data: unsafe { data.raw.as_ref() },
-            index: index.0,
-        }
-    }
-
-    /// Observe a site after forward dynamics. Panics if the index is out of range.
-    pub fn site<'a>(&'a self, data: &'a Data, index: SiteIndex) -> Site<'a> {
-        self.check_data(data);
-        unsafe { Site::new(self.raw.as_ref(), data.raw.as_ref(), index.0) }
+        unsafe { Body::new(self.raw.as_ref(), data.raw.as_ref(), index.0) }
     }
 }
 
@@ -126,9 +116,9 @@ pub struct AppliedForces<'a> {
     _borrow: std::marker::PhantomData<&'a mut Data>,
 }
 impl AppliedForces<'_> {
-    /// Observe a site at the current dynamics evaluation. Panics if the index is out of range.
-    pub fn site(&self, index: SiteIndex) -> Site<'_> {
-        unsafe { Site::new(&*self.model, &*self.data, index.0) }
+    /// Observe a body at the current dynamics evaluation. Panics if the index is out of range.
+    pub fn body(&self, index: BodyIndex) -> Body<'_> {
+        unsafe { Body::new(&*self.model, &*self.data, index.0) }
     }
 
     /// Set joint-space loads for this dynamics evaluation.

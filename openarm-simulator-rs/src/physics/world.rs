@@ -8,7 +8,7 @@ use mujoco::{
     SiteIndex,
 };
 use openarm_simulator_core::{
-    AppliedForce, BodyState, SceneNames, SiteState, Spring, SpringState,
+    AppliedForce, Attachment, BodyPoint, BodyState, SceneNames, Spring, SpringState,
     mint::Quaternion,
     uom::si::{
         acceleration::meter_per_second_squared,
@@ -443,21 +443,22 @@ impl Physics {
         }
     }
 
-    pub fn springs(&self) -> &BTreeMap<String, Spring> {
+    pub fn springs(&self) -> &BTreeMap<String, Spring<BodyPoint>> {
         &self.loads.springs
     }
-    pub fn forces(&self) -> &BTreeMap<String, AppliedForce> {
+    pub fn forces(&self) -> &BTreeMap<String, AppliedForce<BodyPoint>> {
         &self.loads.forces
     }
 
     pub fn put_spring(&mut self, name: String, spring: Spring) -> Result<bool> {
         name_valid(&name)?;
-        for site in &spring.sites {
-            ensure!(
-                site.0 < self.model.count::<SiteIndex>(),
-                "site index out of range: {site}"
-            );
-        }
+        let [a, b] = spring.endpoints;
+        let spring = Spring {
+            endpoints: [self.resolve_point(a)?, self.resolve_point(b)?],
+            rest_length: spring.rest_length,
+            stiffness: spring.stiffness,
+            damping: spring.damping,
+        };
         ensure!(
             [
                 spring.rest_length.get::<meter>(),
@@ -480,11 +481,11 @@ impl Physics {
 
     pub fn put_force(&mut self, name: String, force: AppliedForce) -> Result<bool> {
         name_valid(&name)?;
-        ensure!(
-            force.site.0 < self.model.count::<SiteIndex>(),
-            "site index out of range: {}",
-            force.site
-        );
+        let force = AppliedForce {
+            point: self.resolve_point(force.point)?,
+            force: force.force,
+            torque: force.torque,
+        };
         ensure!(
             <[Force; 3]>::from(force.force)
                 .iter()
@@ -504,6 +505,35 @@ impl Physics {
         self.forward();
     }
 
+    fn resolve_point(&self, attachment: Attachment) -> Result<BodyPoint> {
+        let point = match attachment {
+            Attachment::Body(point) => point,
+            Attachment::Site(index) => {
+                ensure!(
+                    index.0 < self.model.count::<SiteIndex>(),
+                    "site index out of range: {index}"
+                );
+                let (body, position) = self.model.site_point(index);
+                BodyPoint {
+                    body,
+                    position: position.map(Length::new::<meter>).into(),
+                }
+            }
+        };
+        ensure!(
+            point.body.0 < self.model.count::<BodyIndex>(),
+            "body index out of range: {}",
+            point.body
+        );
+        ensure!(
+            <[Length; 3]>::from(point.position)
+                .iter()
+                .all(|v| v.value.is_finite()),
+            "attachment position must be finite"
+        );
+        Ok(point)
+    }
+
     pub fn body_states(&self) -> Vec<BodyState> {
         (0..self.model.count::<BodyIndex>())
             .map(|index| {
@@ -517,25 +547,15 @@ impl Physics {
             .collect()
     }
 
-    pub fn site_states(&self) -> Vec<SiteState> {
-        (0..self.model.count::<SiteIndex>())
-            .map(|index| {
-                let site = self.model.site(&self.data, SiteIndex(index));
-                SiteState {
-                    position: site.position().map(Length::new::<meter>).into(),
-                    orientation: quaternion(site.orientation()),
-                }
-            })
-            .collect()
-    }
-
     pub fn spring_states(&self) -> BTreeMap<String, SpringState> {
         self.loads
             .springs
             .iter()
             .map(|(name, spring)| {
-                let states = spring.sites.map(|index| self.model.site(&self.data, index));
-                let (length, velocity, _) = spring_geometry(&states);
+                let bodies = spring
+                    .endpoints
+                    .map(|point| self.model.body(&self.data, point.body));
+                let (length, velocity, _) = spring_geometry(&bodies, &spring.endpoints);
                 (
                     name.clone(),
                     SpringState {
@@ -1099,52 +1119,46 @@ mod tests {
     }
 
     fn scene(integrator: &str, native_spring: bool) -> Physics {
-        let tendon = if native_spring {
-            "<tendon><spatial name='native' stiffness='40' damping='3' springlength='1'><site site='left_site'/><site site='right_site'/></spatial></tendon>"
+        let (left_site, right_site, tendon) = if native_spring {
+            (
+                "<site name='left_site' pos='0 .2 0'/>",
+                "<site name='right_site' pos='0 -.1 0'/>",
+                "<tendon><spatial name='native' stiffness='40' damping='3' springlength='1'><site site='left_site'/><site site='right_site'/></spatial></tendon>",
+            )
         } else {
-            ""
+            ("", "", "")
         };
         let model = Model::from_xml_bytes(format!(r#"<mujoco>
             <option gravity="0 0 0" integrator="{integrator}"><flag contact="disable"/></option>
             <worldbody>
-              <body>
-                <site name="anchor" pos="2 -.1 0"/>
-                <site name="stretch" pos="4 -.1 0"/>
-                <site name="compress" pos="2.5 -.1 0"/>
-              </body>
-              <body name="left"><freejoint/><inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
-                <site name="left_site" pos="0 .2 0"/>
-                <site pos="0 .3 0"/>
+              <body name="left"><freejoint/><inertial pos=".1 0 0" mass="1" diaginertia="1 1 1"/>
+                {left_site}
               </body>
               <body name="right" pos="2 0 0"><freejoint/><inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
-                <site name="right_site" pos="0 -.1 0"/>
+                {right_site}
               </body>
             </worldbody>{tendon}</mujoco>"#).as_bytes()).unwrap();
         Physics::new(model, &Config::default()).unwrap()
     }
-    fn spring(a: SiteIndex, b: SiteIndex) -> Spring {
+    fn point(body: BodyIndex, position: [f64; 3]) -> BodyPoint {
+        BodyPoint {
+            body,
+            position: position.map(Length::new::<meter>).into(),
+        }
+    }
+    fn spring(a: BodyPoint, b: BodyPoint) -> Spring {
         Spring {
-            sites: [a, b],
+            endpoints: [Attachment::Body(a), Attachment::Body(b)],
             rest_length: Length::new::<meter>(1.),
             stiffness: Force::new::<newton>(40.) / Length::new::<meter>(1.),
             damping: Force::new::<newton>(3.) / Velocity::new::<meter_per_second>(1.),
         }
     }
-    fn force(site: SiteIndex) -> AppliedForce {
+    fn force(point: BodyPoint) -> AppliedForce {
         AppliedForce {
-            site,
-            force: [
-                Force::new::<newton>(1.),
-                Force::new::<newton>(0.),
-                Force::new::<newton>(0.),
-            ]
-            .into(),
-            torque: [
-                Torque::new::<newton_meter>(0.),
-                Torque::new::<newton_meter>(0.),
-                Torque::new::<newton_meter>(2.),
-            ]
-            .into(),
+            point: Attachment::Body(point),
+            force: [1., 0., 0.].map(Force::new::<newton>).into(),
+            torque: [0., 0., 2.].map(Torque::new::<newton_meter>).into(),
         }
     }
     fn close(a: &[f64], b: &[f64]) {
@@ -1158,8 +1172,14 @@ mod tests {
         for integrator in ["Euler", "RK4"] {
             let mut reference = scene(integrator, true);
             let mut custom = scene(integrator, false);
-            let left = custom.names().sites["left_site"];
-            let right = custom.names().sites["right_site"];
+            let left = point(custom.names().bodies["left"], [0., 0.2, 0.]);
+            let right = point(custom.names().bodies["right"], [0., -0.1, 0.]);
+            let mut indexed = spring(left, right);
+            indexed.endpoints = ["left_site", "right_site"]
+                .map(|name| Attachment::Site(reference.names().sites[name]));
+            reference.put_spring("lookup".into(), indexed).unwrap();
+            assert_eq!(reference.springs()["lookup"].endpoints, [left, right]);
+            reference.delete_spring("lookup");
             custom
                 .put_spring("spring".into(), spring(left, right))
                 .unwrap();
@@ -1184,37 +1204,34 @@ mod tests {
     }
 
     #[test]
-    fn forces_and_springs_use_model_sites() {
-        let mut p = scene("implicitfast", true);
-        let [left, right, anchor, stretch, compress] =
-            ["left_site", "right_site", "anchor", "stretch", "compress"]
-                .map(|name| p.names().sites[name]);
-        let missing = SiteIndex(p.model.count::<SiteIndex>());
+    fn forces_and_springs_update_body_points_without_sites() {
+        let mut p = scene("implicitfast", false);
+        let left = point(p.names().bodies["left"], [0., 0.2, 0.]);
+        let right = point(p.names().bodies["right"], [0., -0.1, 0.]);
+        let anchor = point(BodyIndex(0), [2., -0.1, 0.]);
+        let stretch = point(BodyIndex(0), [4., -0.1, 0.]);
+        let compress = point(BodyIndex(0), [2.5, -0.1, 0.]);
+        let missing = point(BodyIndex(p.model.count::<BodyIndex>()), [0.; 3]);
         let initial_bodies = p.body_states();
-        let initial_sites = p.site_states();
         let names = p.names();
-        let unnamed_site = SiteIndex(left.0 + 1);
-        assert_eq!(initial_sites.len(), p.model.count::<SiteIndex>());
-        assert_eq!(initial_bodies.len(), p.model.count::<BodyIndex>());
-        assert!(!names.sites.values().any(|index| *index == unnamed_site));
-        p.put_force("unnamed".into(), force(unnamed_site)).unwrap();
-        close(
-            p.data.view().qfrc_applied,
-            &[1., 0., 0., 0., 0., 1.7, 0., 0., 0., 0., 0., 0.],
-        );
-        p.delete_force("unnamed");
-        let native_force = p.data.view().qfrc_passive.to_vec();
+        assert_eq!(p.model.count::<SiteIndex>(), 0);
         p.put_force("load".into(), force(left)).unwrap();
         // F=(1,0,0) at y=.2 contributes -.2 Nm, plus the explicit +2 Nm torque.
         close(
             p.data.view().qfrc_applied,
             &[1., 0., 0., 0., 0., 1.8, 0., 0., 0., 0., 0., 0.],
         );
+        let moved = point(left.body, [0., 0.3, 0.]);
+        assert!(!p.put_force("load".into(), force(moved)).unwrap());
+        close(
+            p.data.view().qfrc_applied,
+            &[1., 0., 0., 0., 0., 1.7, 0., 0., 0., 0., 0., 0.],
+        );
         let mut invalid = force(left);
         invalid.force.x = Force::new::<newton>(f64::NAN);
         assert!(p.put_force("load".into(), invalid).is_err());
         assert!(p.put_force("load".into(), force(missing)).is_err());
-        assert_eq!(p.forces()["load"], force(left));
+        assert_eq!(p.forces()["load"].point, moved);
         assert!(!p.put_force("load".into(), force(right)).unwrap());
         close(
             p.data.view().qfrc_applied,
@@ -1222,47 +1239,50 @@ mod tests {
         );
         p.delete_force("load");
         assert!(p.data.view().qfrc_applied.iter().all(|v| *v == 0.));
-        // API springs have their own IDs and do not replace the native tendon.
-        // The anchor's parent body need not have a name.
-        p.put_spring("native".into(), spring(right, anchor))
+        p.put_spring("spring".into(), spring(right, anchor))
             .unwrap();
-        assert_eq!(p.spring_states()["native"].length.get::<meter>(), 0.);
+        assert_eq!(p.spring_states()["spring"].length.get::<meter>(), 0.);
         assert!(p.data.view().qfrc_applied.iter().all(|v| *v == 0.));
-        p.put_spring("native".into(), spring(right, stretch))
+        p.put_spring("spring".into(), spring(right, stretch))
             .unwrap();
         assert_eq!(p.data.view().qfrc_applied[6], 40.);
-        p.put_spring("native".into(), spring(right, compress))
+        p.put_spring("spring".into(), spring(right, compress))
             .unwrap();
         assert_eq!(p.data.view().qfrc_applied[6], -20.);
         assert!(
-            p.put_spring("native".into(), spring(right, missing))
+            p.put_spring("spring".into(), spring(right, missing))
                 .is_err()
         );
-        assert_eq!(p.springs()["native"], spring(right, compress));
         let mut invalid = spring(left, anchor);
         invalid.damping.value = -1.;
-        assert!(p.put_spring("native".into(), invalid).is_err());
-        p.delete_spring("native");
-        close(p.data.view().qfrc_passive, &native_force);
+        assert!(p.put_spring("spring".into(), invalid).is_err());
+        let invalid = point(left.body, [f64::NAN, 0., 0.]);
+        assert!(p.put_force("load".into(), force(invalid)).is_err());
+        for endpoints in [[invalid, right], [left, invalid]] {
+            assert!(
+                p.put_spring("spring".into(), spring(endpoints[0], endpoints[1]))
+                    .is_err()
+            );
+        }
+        assert!(p.forces().is_empty());
+        assert_eq!(p.springs()["spring"].endpoints, [right, compress]);
+        p.delete_spring("spring");
         assert_eq!(p.body_states(), initial_bodies);
-        assert_eq!(p.site_states(), initial_sites);
         p.put_force("load".into(), force(left)).unwrap();
         p.put_spring("spring".into(), spring(left, anchor)).unwrap();
         p.step(100, &[]).unwrap();
         p.reset().unwrap();
         assert_eq!(p.names(), names);
-        assert_eq!(p.site_states(), initial_sites);
         assert_eq!(p.body_states(), initial_bodies);
         assert!(p.forces().is_empty() && p.springs().is_empty());
-        close(p.data.view().qfrc_passive, &native_force);
         assert!(p.data.view().qfrc_applied.iter().all(|v| *v == 0.));
     }
 
     #[test]
     fn spring_damping_dissipates_energy_at_configured_step() {
         let mut p = scene("implicitfast", false);
-        let left = p.names().sites["left_site"];
-        let right = p.names().sites["right_site"];
+        let left = point(p.names().bodies["left"], [0., 0.2, 0.]);
+        let right = point(p.names().bodies["right"], [0., -0.1, 0.]);
         p.put_spring("spring".into(), spring(left, right)).unwrap();
         let energy = |p: &mut Physics| {
             let extension = p.spring_states()["spring"].length.get::<meter>() - 1.;

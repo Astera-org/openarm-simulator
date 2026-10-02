@@ -16,7 +16,7 @@ import unittest
 from serde.json import from_json, to_json
 
 from openarm_simulator_client import APIError, Client
-from openarm_simulator_client.models import AppliedForce, Configuration, Fault, HingeJointParameters, Integrator, MappingRanges, MotorCommand, SiteIndex, SlideJointParameters, Spring, State
+from openarm_simulator_client.models import AppliedForce, BodyIndex, BodyPoint, Configuration, Fault, HingeJointParameters, Integrator, MappingRanges, MotorCommand, SlideJointParameters, Spring, State
 
 
 class ClientTest(unittest.TestCase):
@@ -74,7 +74,7 @@ class ClientTest(unittest.TestCase):
                 self.assertIs(configuration.configuration.integrator, Integrator.IMPLICIT_FAST)
                 names = client.names()
                 joint = names.joints["openarm_left_joint7"]
-                site = names.sites["world_site"]
+                point = BodyPoint(BodyIndex(0), (0.0, 0.0, 0.0))
                 self.assertEqual(from_json(State, to_json(state)), state)
                 self.assertEqual(from_json(Configuration, to_json(configuration)), configuration)
                 self.assertIsInstance(configuration.configuration.joints[names.joints["openarm_left_joint1"]], HingeJointParameters)
@@ -124,24 +124,28 @@ class ClientTest(unittest.TestCase):
                         client.advance(duration)
 
                 id = "load / #α"
-                spring = Spring((site, site), 0.1, 1.0, 0.2)
-                force = AppliedForce(site, (0.1, 0.0, 0.0), (0.0, 0.0, 0.0))
+                spring = Spring((names.sites["world_site"], point), 0.1, 1.0, 0.2)
+                force = AppliedForce(names.sites["world_site"], (0.1, 0.0, 0.0), (0.0, 0.0, 0.0))
                 self.assertEqual(client.put_spring(id, spring), HTTPStatus.CREATED)
-                self.assertEqual(client.spring(id), spring)
+                spring.endpoints = (point, point)
                 self.assertEqual(client.springs()[id], spring)
                 self.assertEqual(client.put_force(id, force), HTTPStatus.CREATED)
-                self.assertEqual(client.force(id), force)
+                force.point = point
                 self.assertEqual(client.forces()[id], force)
                 with self.assertRaises(APIError) as error:
-                    client.put_force(id, AppliedForce(SiteIndex(len(state.sites)), force.force_world_n, force.torque_world_nm))
+                    client.put_force(id, AppliedForce(BodyPoint(BodyIndex(len(state.bodies)), point.position_local_m), force.force_world_n, force.torque_world_nm))
                 self.assertEqual(error.exception.status, 400)
                 client.unpause()
+                force.point = BodyPoint(BodyIndex(0), (0.5, 0.0, 0.0))
+                spring.endpoints = (point, BodyPoint(BodyIndex(0), (0.3, 0.4, 0.0)))
                 self.assertEqual(client.put_force(id, force), HTTPStatus.NO_CONTENT)
                 self.assertEqual(client.put_spring(id, spring), HTTPStatus.NO_CONTENT)
                 client.pause()
                 observed = client.state()
-                self.assertEqual(observed.springs[id].length_m, 0.0)
-                self.assertEqual(observed.sites[site], state.sites[site])
+                self.assertEqual(client.force(id), force)
+                self.assertEqual(client.spring(id), spring)
+                self.assertEqual(observed.springs[id].length_m, 0.5)
+                self.assertEqual(observed.springs[id].velocity_m_s, 0.0)
                 self.assertEqual(client.delete_spring(id), HTTPStatus.NO_CONTENT)
                 self.assertEqual(client.delete_force(id), HTTPStatus.NO_CONTENT)
                 with self.assertRaises(APIError) as error:

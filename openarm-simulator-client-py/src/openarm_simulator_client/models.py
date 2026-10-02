@@ -153,31 +153,37 @@ class BodyParameters:
 
 
 @serde
+class BodyPoint:
+    """Attachment in a body's local frame. Body 0 is the world."""
+
+    body: BodyIndex
+    position_local_m: Vector3
+
+
+# Writes resolve site indices to body points; reads return body points.
+Attachment = SiteIndex | BodyPoint
+
+
+@serde(tagging=Untagged)
 class Spring:
-    """Spring and axial damper between two MJCF sites; separate from MJCF tendons.
+    """Spring and axial damper between body points; separate from MJCF tendons.
 
     Acts in tension and compression. Coincident endpoints exert no force.
     """
 
-    sites: tuple[SiteIndex, SiteIndex]
+    endpoints: tuple[Attachment, Attachment]
     rest_length_m: float
     stiffness_n_per_m: float
     damping_n_s_per_m: float
 
 
-@serde
+@serde(tagging=Untagged)
 class AppliedForce:
-    """Persistent force and torque in world axes, applied at an MJCF site."""
+    """Persistent force and torque in world axes, applied at a body point."""
 
-    site: SiteIndex
+    point: Attachment
     force_world_n: Vector3
     torque_world_nm: Vector3
-
-
-@serde
-class SiteState:
-    position_world_m: Vector3
-    orientation_world_xyzw: tuple[float, float, float, float]
 
 
 @serde
@@ -211,7 +217,6 @@ class State:
     timestep_ns: int
     plant: Plant
     bodies: list[BodyState]
-    sites: list[SiteState]
     springs: dict[str, SpringState]
 
 

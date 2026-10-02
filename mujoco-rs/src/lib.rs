@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 mod scene;
-pub use scene::{AppliedForces, Body, Site};
+pub use scene::{AppliedForces, Body};
 
 pub const NREF: usize = ffi::mjNREF as usize;
 pub const NIMP: usize = ffi::mjNIMP as usize;
@@ -585,12 +585,16 @@ mod tests {
         assert!(first.warnings().iter().all(|w| w.number == 0));
         assert_ne!(first.view().qpos[0], 0.);
         model.forward(&mut first);
-        let site = model.site(&first, model.id::<SiteIndex>("tip").unwrap());
-        assert_eq!(site.body(), model.id::<BodyIndex>("ball").unwrap());
-        assert_eq!(*site.position(), [0.2, 0., first.view().qpos[0]]);
-        assert_eq!(site.orientation(), [1., 0., 0., 0.]);
-        assert_eq!(site.velocity(), [0., 0., first.view().qvel[0]]);
-        let body = model.body(&first, site.body());
+        let body = model.body(&first, model.id::<BodyIndex>("ball").unwrap());
+        assert_eq!(
+            body.point_position([0.2, 0., 0.]),
+            [0.2, 0., first.view().qpos[0]]
+        );
+        assert_eq!(
+            body.point_velocity([0.2, 0., 0.]),
+            [0., 0., first.view().qvel[0]]
+        );
+        assert_eq!(*body.orientation(), [1., 0., 0., 0.]);
         assert_eq!(*body.position(), [0., 0., first.view().qpos[0]]);
         assert_eq!(second.view().qpos[0], 0.);
         assert!(second.view().ctrl.is_empty());
@@ -614,14 +618,11 @@ mod tests {
         let mut data = Data::new(&original).unwrap();
         drop(original);
         let mut other = Model::from_xml_bytes(b"<mujoco/>").unwrap();
-        let operations: [fn(&mut Model, &mut Data); 7] = [
+        let operations: [fn(&mut Model, &mut Data); 6] = [
             |m, d| m.reset_data(d),
             |m, d| m.forward(d),
             |m, d| m.set_constants(d),
             |m, d| m.step(d),
-            |m, d| {
-                m.site(d, SiteIndex(0));
-            },
             |m, d| {
                 m.body(d, BodyIndex(0));
             },

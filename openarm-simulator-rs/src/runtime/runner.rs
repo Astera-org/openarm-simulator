@@ -119,7 +119,6 @@ fn snapshot(
         timestep_ns: simulation.physics.timestep_ns,
         plant: simulation.physics.parameters(),
         bodies: simulation.physics.body_states(),
-        sites: simulation.physics.site_states(),
         springs: simulation.physics.spring_states(),
     }
 }

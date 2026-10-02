@@ -7,12 +7,29 @@ use uom::si::f64::{Force, Length, Torque, Velocity};
 pub type SpringStiffness = <Force as Div<Length>>::Output;
 pub type SpringDamping = <Force as Div<Velocity>>::Output;
 
-/// A spring and axial damper between two MJCF sites, acting in tension and compression.
+/// An attachment point in a body's local frame. Body 0 is the world.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BodyPoint {
+    pub body: BodyIndex,
+    #[serde(rename = "position_local_m")]
+    pub position: Point3<Length>,
+}
+
+/// A site index or inline body point. Writes resolve sites; reads return body points.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Attachment {
+    Site(SiteIndex),
+    Body(BodyPoint),
+}
+
+/// A spring and axial damper between two body points, acting in tension and compression.
 /// Coincident endpoints exert no force. These springs are separate from MJCF tendons.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Spring {
-    pub sites: [SiteIndex; 2],
+pub struct Spring<P = Attachment> {
+    pub endpoints: [P; 2],
     #[serde(rename = "rest_length_m")]
     pub rest_length: Length,
     #[serde(rename = "stiffness_n_per_m")]
@@ -21,23 +38,15 @@ pub struct Spring {
     pub damping: SpringDamping,
 }
 
-/// A persistent load at an MJCF site. Force and torque are expressed in world axes.
+/// A persistent load at a body point. Force and torque are expressed in world axes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AppliedForce {
-    pub site: SiteIndex,
+pub struct AppliedForce<P = Attachment> {
+    pub point: P,
     #[serde(rename = "force_world_n")]
     pub force: Vector3<Force>,
     #[serde(rename = "torque_world_nm")]
     pub torque: Vector3<Torque>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SiteState {
-    #[serde(rename = "position_world_m")]
-    pub position: Point3<Length>,
-    #[serde(rename = "orientation_world_xyzw")]
-    pub orientation: Quaternion<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

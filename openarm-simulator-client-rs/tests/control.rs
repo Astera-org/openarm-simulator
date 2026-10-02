@@ -3,7 +3,8 @@
 use openarm_simulator_client::{
     Client, Error, StatusCode,
     models::{
-        AppliedForce, Fault, MappingRanges, MotorStatus, Push, SiteIndex, Spring,
+        AppliedForce, Attachment, BodyIndex, BodyPoint, Fault, MappingRanges, MotorStatus, Push,
+        SiteIndex, Spring,
         uom::si::{
             angle::radian,
             angular_velocity::radian_per_second,
@@ -144,7 +145,10 @@ fn control_api_against_simulator() {
             );
             let names = client.names().await.unwrap();
             let joint = names.joints["openarm_left_joint7"];
-            let site = names.sites["world_site"];
+            let point = BodyPoint {
+                body: BodyIndex(0),
+                position: [Length::new::<meter>(0.); 3].into(),
+            };
             assert_eq!(initial.timestep_ns, configuration.configuration.timestep_ns);
             assert_eq!(client.pause().await.unwrap(), StatusCode::NO_CONTENT);
             assert_eq!(
@@ -223,13 +227,16 @@ fn control_api_against_simulator() {
             client.reset().await.unwrap();
             let id = "load / #α";
             let mut spring = Spring {
-                sites: [site, site],
+                endpoints: [
+                    Attachment::Site(names.sites["world_site"]),
+                    Attachment::Body(point),
+                ],
                 rest_length: Length::new::<meter>(0.1),
                 stiffness: Force::new::<newton>(1.) / Length::new::<meter>(1.),
                 damping: Force::new::<newton>(0.2) / Velocity::new::<meter_per_second>(1.),
             };
             let mut force = AppliedForce {
-                site,
+                point: Attachment::Site(names.sites["world_site"]),
                 force: [Force::new::<newton>(0.1); 3].into(),
                 torque: [Torque::new::<newton_meter>(0.); 3].into(),
             };
@@ -237,13 +244,13 @@ fn control_api_against_simulator() {
                 client.put_spring(id, &spring).await.unwrap(),
                 StatusCode::CREATED
             );
-            assert_eq!(client.spring(id).await.unwrap(), spring);
+            spring.endpoints[0] = Attachment::Body(point);
             assert_eq!(client.springs().await.unwrap()[id], spring);
             assert_eq!(
                 client.put_force(id, &force).await.unwrap(),
                 StatusCode::CREATED
             );
-            assert_eq!(client.force(id).await.unwrap(), force);
+            force.point = Attachment::Body(point);
             assert_eq!(client.forces().await.unwrap()[id], force);
             assert!(matches!(
                 client
@@ -257,7 +264,10 @@ fn control_api_against_simulator() {
                     ..
                 })
             ));
-            force.site = SiteIndex(initial.sites.len());
+            force.point = Attachment::Body(BodyPoint {
+                body: BodyIndex(initial.bodies.len()),
+                ..point
+            });
             assert!(matches!(
                 client.put_force(id, &force).await,
                 Err(Error::Api {
@@ -265,8 +275,7 @@ fn control_api_against_simulator() {
                     ..
                 })
             ));
-            force.site = site;
-            spring.sites[1] = SiteIndex(initial.sites.len());
+            spring.endpoints[1] = Attachment::Site(SiteIndex(usize::MAX));
             assert!(matches!(
                 client.put_spring(id, &spring).await,
                 Err(Error::Api {
@@ -274,9 +283,16 @@ fn control_api_against_simulator() {
                     ..
                 })
             ));
-            spring.sites[1] = site;
             client.unpause().await.unwrap();
             force.force.x = Force::new::<newton>(0.2);
+            force.point = Attachment::Body(BodyPoint {
+                position: [0.5, 0., 0.].map(Length::new::<meter>).into(),
+                ..point
+            });
+            spring.endpoints[1] = Attachment::Body(BodyPoint {
+                position: [0.3, 0.4, 0.].map(Length::new::<meter>).into(),
+                ..point
+            });
             spring.rest_length = Length::new::<meter>(0.2);
             assert_eq!(
                 client.put_force(id, &force).await.unwrap(),
@@ -288,8 +304,13 @@ fn control_api_against_simulator() {
             );
             client.pause().await.unwrap();
             let state = client.state().await.unwrap();
-            assert_eq!(state.sites[site.0], initial.sites[site.0]);
-            assert_eq!(state.springs[id].length, Length::new::<meter>(0.));
+            assert_eq!(client.force(id).await.unwrap(), force);
+            assert_eq!(client.spring(id).await.unwrap(), spring);
+            assert_eq!(state.springs[id].length, Length::new::<meter>(0.5));
+            assert_eq!(
+                state.springs[id].velocity,
+                Velocity::new::<meter_per_second>(0.)
+            );
             assert_eq!(
                 client.delete_spring(id).await.unwrap(),
                 StatusCode::NO_CONTENT
