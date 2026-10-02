@@ -3,8 +3,8 @@ mod physics;
 mod runtime;
 mod simulation;
 use anyhow::{Context, Result, ensure};
+use axum::http::HeaderValue;
 use clap::Parser;
-use hyper::header::HeaderValue;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,

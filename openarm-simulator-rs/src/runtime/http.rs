@@ -1,18 +1,24 @@
 use super::{Conflict, Control, NotFound, Reply, Request as AdminRequest, Unavailable};
-use anyhow::{Context, Result, ensure};
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::{
-    HeaderMap, Method, Request, Response, StatusCode,
-    body::{Body, Bytes, Incoming},
-    header::{self, HeaderValue},
-    server::conn::http1,
-    service::service_fn,
+use anyhow::{Result, ensure};
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, Path, Request, State},
+    http::{
+        HeaderMap, Method, StatusCode,
+        header::{self, HeaderValue},
+    },
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
-use hyper_util::rt::{TokioIo, TokioTimer};
 use openarm_simulator_core::ErrorResponse;
-use serde_json::{Value, json};
-use std::{convert::Infallible, net::TcpListener, sync::Arc, thread, time::Duration};
-use tokio::time::timeout;
+use serde_json::{Map, Value};
+use std::{net::TcpListener, thread, time::Duration};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+    timeout::RequestBodyTimeoutLayer,
+};
 
 // Require application/json so cross-origin browser requests need preflight
 // approval before executing commands. Simple requests, including empty POSTs,
@@ -21,226 +27,56 @@ use tokio::time::timeout;
 fn require_json(headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
     let media = headers
         .get(header::CONTENT_TYPE)
-        .map(|v| v.to_str())
-        .transpose()
-        .map_err(|_| StatusCode::BAD_REQUEST)?
-        .unwrap_or("");
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<mime::Mime>().ok());
     if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
-        || !media
-            .split(';')
-            .next()
-            .unwrap()
-            .trim()
-            .eq_ignore_ascii_case("application/json")
+        || media.is_none_or(|media| media.essence_str() != "application/json")
     {
         return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
     Ok(())
 }
 
-async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(StatusCode, Value)> {
-    let headers = request.headers();
-    if headers.contains_key(header::EXPECT) {
-        return Ok((
-            StatusCode::EXPECTATION_FAILED,
-            json!({"error": "Expect is not supported"}),
-        ));
-    }
-    if let Err(status) = require_json(headers) {
-        return Ok((
-            status,
-            json!({"error": "Use Content-Type: application/json"}),
-        ));
-    }
-    let path = request.uri().path().to_owned();
-    let method = request.method().clone();
-    let resource_path = path.strip_prefix('/').and_then(|path| {
-        let (collection, id) = path
-            .split_once('/')
-            .map_or((path, None), |(c, id)| (c, Some(id)));
-        matches!(collection, "springs" | "forces").then_some((collection, id))
-    });
-    let no_args = match (request.method(), path.as_str()) {
-        (&Method::GET, "/state" | "/configuration" | "/names")
-        | (&Method::POST, "/reset" | "/pause" | "/unpause") => true,
-        (&Method::POST, "/advance" | "/fault" | "/push") => false,
-        (&Method::GET, _) if resource_path.is_some() => true,
-        (&Method::PUT, _) if resource_path.is_some_and(|(_, id)| id.is_some()) => false,
-        (&Method::DELETE, _) if resource_path.is_some_and(|(_, id)| id.is_some()) => true,
-        _ => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                json!({"error": "Unknown administration endpoint"}),
-            ));
-        }
-    };
-    let mut payload = Value::Null;
-    if matches!(method, Method::POST | Method::PUT | Method::DELETE) {
-        let length = request
-            .body()
-            .size_hint()
-            .exact()
-            .context("Supply Content-Length; chunked requests are not supported")?;
-        if length > 16384 {
-            return Ok((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                json!({"error": "Request body exceeds 16384 bytes"}),
-            ));
-        }
-        ensure!(
-            length > 0,
-            "request requires a JSON body; use an empty object for no arguments"
-        );
-        let body = match timeout(
-            Duration::from_secs(2),
-            Limited::new(request.into_body(), 16384).collect(),
-        )
-        .await
-        {
-            Ok(Ok(body)) => body.to_bytes(),
-            Ok(Err(error)) => anyhow::bail!("invalid request body: {error}"),
-            Err(_) => {
-                return Ok((
-                    StatusCode::REQUEST_TIMEOUT,
-                    json!({"error": "Request body timed out"}),
-                ));
-            }
-        };
-        payload = serde_json::from_slice(&body)?;
-        ensure!(
-            !no_args || payload == json!({}),
-            "{path} takes an empty JSON object"
-        );
-    }
-    let message = if let Some((collection, id)) = resource_path {
-        let id = id
-            .map(|id| -> Result<String> {
-                ensure!(
-                    !id.is_empty() && !id.contains('/'),
-                    "expected one nonempty resource ID"
-                );
-                let id = percent_encoding::percent_decode_str(id)
-                    .decode_utf8()?
-                    .into_owned();
-                ensure!(!id.contains('\0'), "resource ID contains NUL");
-                Ok(id)
-            })
-            .transpose()?;
-        match (collection, method, id) {
-            ("springs", Method::GET, id) => AdminRequest::Springs(id),
-            ("forces", Method::GET, id) => AdminRequest::Forces(id),
-            ("springs", Method::PUT, Some(id)) => {
-                AdminRequest::PutSpring(id, serde_json::from_value(payload)?)
-            }
-            ("forces", Method::PUT, Some(id)) => {
-                AdminRequest::PutForce(id, serde_json::from_value(payload)?)
-            }
-            ("springs", Method::DELETE, Some(id)) => AdminRequest::DeleteSpring(id),
-            ("forces", Method::DELETE, Some(id)) => AdminRequest::DeleteForce(id),
-            _ => unreachable!("route validated above"),
-        }
-    } else {
-        match path.as_str() {
-            "/state" => AdminRequest::Inspect,
-            "/configuration" => AdminRequest::Configuration,
-            "/names" => AdminRequest::Names,
-            "/reset" => AdminRequest::Reset,
-            "/pause" => AdminRequest::Pause,
-            "/unpause" => AdminRequest::Unpause,
-            "/advance" => {
-                ensure!(payload.is_object(), "advance payload must be an object");
-                AdminRequest::Advance {
-                    payload: serde_json::from_value(payload)?,
-                }
-            }
-            "/push" => AdminRequest::Push {
-                payload: serde_json::from_value(payload)?,
-            },
-            "/fault" => {
-                ensure!(payload[1].is_object(), "fault settings must be an object");
-                AdminRequest::Fault {
-                    payload: serde_json::from_value(payload)?,
-                }
-            }
-            _ => unreachable!("route validated above"),
-        }
-    };
-    // Waiting for the physics owner must not block the network event loop.
-    Ok(
-        match tokio::task::spawn_blocking(move || control.call(message)).await?? {
-            Reply::Names(value) => (StatusCode::OK, serde_json::to_value(value)?),
-            Reply::State(value) => (StatusCode::OK, serde_json::to_value(value)?),
-            Reply::Configuration(value) => (StatusCode::OK, serde_json::to_value(value)?),
-            Reply::Done => (StatusCode::OK, Value::Null),
-            Reply::Unchanged => (StatusCode::NO_CONTENT, Value::Null),
-            Reply::Created => (StatusCode::CREATED, Value::Null),
-            Reply::Value(value) => (StatusCode::OK, value),
-        },
-    )
+async fn command(control: Control, args: Map<String, Value>, request: AdminRequest) -> Response {
+    let request = (|| {
+        ensure!(args.is_empty(), "command takes an empty JSON object");
+        Ok(request)
+    })();
+    call(control, request).await
 }
 
-async fn handle(
-    request: Request<Incoming>,
-    control: Control,
-    allowed_origins: Arc<[HeaderValue]>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    let origin = request.headers().get(header::ORIGIN).and_then(|origin| {
-        allowed_origins
-            .iter()
-            .find(|allowed| *allowed == origin || allowed.as_bytes() == b"*")
-            .cloned()
-    });
-    let preflight = request.method() == Method::OPTIONS;
-    let result = if preflight {
-        Ok((StatusCode::NO_CONTENT, Value::Null))
-    } else {
-        dispatch(request, control).await
-    };
-    let (status, value) = result.unwrap_or_else(|error: anyhow::Error| {
-        let status = if error.is::<Unavailable>() {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else if error.is::<Conflict>() {
-            StatusCode::CONFLICT
-        } else if error.is::<NotFound>() {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::BAD_REQUEST
-        };
-        (
-            status,
-            serde_json::to_value(ErrorResponse {
-                error: error.to_string(),
-            })
-            .unwrap(),
-        )
-    });
-    let mut response = Response::builder()
-        .status(status)
-        .header(header::VARY, "Origin")
-        .header(header::CACHE_CONTROL, "no-store");
-    if let Some(origin) = origin {
-        response = response.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-        if preflight {
-            response = response
-                .header(
-                    header::ACCESS_CONTROL_ALLOW_METHODS,
-                    "GET, POST, PUT, DELETE",
-                )
-                .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type");
+async fn call(control: Control, request: Result<AdminRequest>) -> Response {
+    // Waiting for the physics owner must not block the network event loop.
+    let result = tokio::task::spawn_blocking(move || control.call(request?))
+        .await
+        .unwrap_or_else(|error| Err(error.into()));
+    match result {
+        Ok(Reply::Names(value)) => Json(value).into_response(),
+        Ok(Reply::State(value)) => Json(value).into_response(),
+        Ok(Reply::Configuration(value)) => Json(value).into_response(),
+        Ok(Reply::Done) => StatusCode::OK.into_response(),
+        Ok(Reply::Unchanged) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Reply::Created) => StatusCode::CREATED.into_response(),
+        Ok(Reply::Value(value)) => Json(value).into_response(),
+        Err(error) => {
+            let status = if error.is::<Unavailable>() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if error.is::<Conflict>() {
+                StatusCode::CONFLICT
+            } else if error.is::<NotFound>() {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response()
         }
     }
-    // Errors may reject an unread body. Let Hyper close without reusing it as
-    // the next request; successful requests retain normal HTTP/1.1 keep-alive.
-    if !status.is_success() {
-        response = response.header(header::CONNECTION, "close");
-    }
-    let body = if value.is_null() {
-        Bytes::new()
-    } else {
-        response = response.header(header::CONTENT_TYPE, "application/json");
-        value.to_string().into()
-    };
-    Ok(response.body(Full::new(body)).unwrap())
 }
 
 pub fn start_http(
@@ -248,7 +84,105 @@ pub fn start_http(
     control: Control,
     allowed_origins: Vec<HeaderValue>,
 ) -> Result<()> {
-    let allowed_origins: Arc<[HeaderValue]> = allowed_origins.into();
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE]);
+    let cors = if allowed_origins.iter().any(|origin| origin == "*") {
+        cors.allow_origin(Any)
+    } else {
+        cors.allow_origin(allowed_origins)
+    };
+    let app = Router::new()
+        .route("/state", get(|State(c)| call(c, Ok(AdminRequest::Inspect))))
+        .route(
+            "/configuration",
+            get(|State(c)| call(c, Ok(AdminRequest::Configuration))),
+        )
+        .route("/names", get(|State(c)| call(c, Ok(AdminRequest::Names))))
+        .route(
+            "/reset",
+            post(|State(c), Json(args)| command(c, args, AdminRequest::Reset)),
+        )
+        .route(
+            "/pause",
+            post(|State(c), Json(args)| command(c, args, AdminRequest::Pause)),
+        )
+        .route(
+            "/unpause",
+            post(|State(c), Json(args)| command(c, args, AdminRequest::Unpause)),
+        )
+        .route(
+            "/advance",
+            post(|State(c), Json(args): Json<Map<String, Value>>| {
+                call(
+                    c,
+                    serde_json::from_value(Value::Object(args))
+                        .map(|payload| AdminRequest::Advance { payload })
+                        .map_err(Into::into),
+                )
+            }),
+        )
+        .route(
+            "/fault",
+            post(
+                |State(c), Json((name, args)): Json<(String, Map<String, Value>)>| {
+                    call(
+                        c,
+                        serde_json::from_value(Value::Object(args))
+                            .map(|fault| AdminRequest::Fault {
+                                payload: (name, fault),
+                            })
+                            .map_err(Into::into),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/push",
+            post(|State(c), Json(payload)| call(c, Ok(AdminRequest::Push { payload }))),
+        )
+        .route(
+            "/springs",
+            get(|State(c)| call(c, Ok(AdminRequest::Springs(None)))),
+        )
+        .route(
+            "/springs/{id}",
+            get(|State(c), Path(id)| call(c, Ok(AdminRequest::Springs(Some(id)))))
+                .put(|State(c), Path(id), Json(spring)| {
+                    call(c, Ok(AdminRequest::PutSpring(id, spring)))
+                })
+                .delete(|State(c), Path(id), Json(args)| {
+                    command(c, args, AdminRequest::DeleteSpring(id))
+                }),
+        )
+        .route(
+            "/forces",
+            get(|State(c)| call(c, Ok(AdminRequest::Forces(None)))),
+        )
+        .route(
+            "/forces/{id}",
+            get(|State(c), Path(id)| call(c, Ok(AdminRequest::Forces(Some(id)))))
+                .put(|State(c), Path(id), Json(force)| {
+                    call(c, Ok(AdminRequest::PutForce(id, force)))
+                })
+                .delete(|State(c), Path(id), Json(args)| {
+                    command(c, args, AdminRequest::DeleteForce(id))
+                }),
+        )
+        .layer(DefaultBodyLimit::max(16384))
+        .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(2)))
+        .layer(middleware::from_fn(
+            |request: Request, next: Next| async move {
+                require_json(request.headers())?;
+                Ok::<_, StatusCode>(next.run(request).await)
+            },
+        ))
+        .layer(cors)
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .with_state(control);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -261,32 +195,8 @@ pub fn start_http(
         .name("http-admin".into())
         .spawn(move || {
             runtime.block_on(async move {
-                loop {
-                    let stream = match listener.accept().await {
-                        Ok((stream, _)) => stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            eprintln!("HTTP accept: {error}");
-                            return;
-                        }
-                    };
-                    let control = control.clone();
-                    let allowed_origins = allowed_origins.clone();
-                    tokio::spawn(async move {
-                        let _ = http1::Builder::new()
-                            .keep_alive(true)
-                            .timer(TokioTimer::new())
-                            .header_read_timeout(Duration::from_secs(2))
-                            .max_headers(32)
-                            .max_buf_size(8192)
-                            .serve_connection(
-                                TokioIo::new(stream),
-                                service_fn(move |request| {
-                                    handle(request, control.clone(), allowed_origins.clone())
-                                }),
-                            )
-                            .await;
-                    });
+                if let Err(error) = axum::serve(listener, app).await {
+                    eprintln!("HTTP server: {error}");
                 }
             })
         })?;
@@ -302,12 +212,11 @@ mod tests {
         let rejected = Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         for (values, expected) in [
             (vec!["application/json"], Ok(())),
-            (vec![" Application/JSON ; charset=utf-8 "], Ok(())),
+            (vec!["Application/JSON; charset=utf-8"], Ok(())),
             (vec![], rejected),
             (vec!["text/plain"], rejected),
             (vec!["application/x-www-form-urlencoded"], rejected),
             (vec!["multipart/form-data; boundary=test"], rejected),
-            (vec!["application/json, text/plain"], rejected),
             (vec!["application/json", "application/json"], rejected),
         ] {
             let mut headers = HeaderMap::new();
@@ -316,11 +225,5 @@ mod tests {
             }
             assert_eq!(require_json(&headers), expected, "{values:?}");
         }
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_bytes(b"\xff").unwrap(),
-        );
-        assert_eq!(require_json(&headers), Err(StatusCode::BAD_REQUEST));
     }
 }

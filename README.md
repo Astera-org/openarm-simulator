@@ -25,8 +25,13 @@ allow any origin. No cross-origin browser access is permitted by default.
 Every API request must include `Content-Type: application/json`, including GET.
 GET has no body; POST, PUT, and DELETE require valid JSON. Commands without
 arguments (`/reset`, `/pause`, `/unpause`, and DELETE) take `{}`. Missing or
-unsupported content types return 415; empty or invalid command bodies return 400.
-Responses keep their existing status codes and may have no body.
+unsupported content types return 415; malformed JSON returns 400, and input
+validation errors return 400 or 422. Successful commands may have no response
+body. Error bodies may be JSON or plain text.
+
+Request bodies are limited to 16 KiB, including chunked requests. A body that
+stalls for two seconds is rejected before the command executes; this timeout
+does not limit how long an accepted simulator operation can run.
 
 ```js
 await fetch("http://127.0.0.1:8080/reset", {
