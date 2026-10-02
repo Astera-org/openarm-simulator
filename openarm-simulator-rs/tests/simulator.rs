@@ -4,6 +4,7 @@ use openarm_simulator_client::{
     Client, Error, StatusCode,
     models::{AppliedForce, Fault, Spring},
 };
+use polling::{Event, Events, Poller};
 use serde_json::json;
 use socketcan::{
     CanFdFrame, CanFdSocket, CanFilter, EmbeddedFrame, Frame, Socket, SocketOptions, StandardId,
@@ -110,16 +111,17 @@ impl Running {
             client: Client::new(&url).unwrap(),
         };
         let stdout = running.child.stdout.take().unwrap();
-        let mut poll = libc::pollfd {
-            fd: stdout.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let poller = Poller::new().unwrap();
+        // SAFETY: stdout remains open until it is removed from the poller below.
+        unsafe { poller.add(&stdout, Event::readable(0)).unwrap() };
         assert_eq!(
-            unsafe { libc::poll(&mut poll, 1, 30_000) },
+            poller
+                .wait(&mut Events::new(), Some(Duration::from_secs(30)))
+                .unwrap(),
             1,
             "startup timeout"
         );
+        poller.delete(&stdout).unwrap();
         let mut line = String::new();
         BufReader::new(stdout).read_line(&mut line).unwrap();
         assert_eq!(line.trim(), format!("HTTP administration: {url}"));
@@ -218,7 +220,7 @@ fn clock_can_and_concurrent_control() {
         // MIT target 0.3 rad, kp=10, kd=0.5. Repeating feedback queries does
         // not change the command; HTTP inspection runs throughout the motion.
         exchange(&bus, 7, [131, 17, 127, 240, 81, 25, 151, 255]);
-        c.unpause().await.unwrap();
+        assert_eq!(c.unpause().await.unwrap(), StatusCode::OK);
         assert_eq!(c.unpause().await.unwrap(), StatusCode::NO_CONTENT);
         assert!(matches!(
             c.advance(Duration::ZERO).await,
@@ -242,7 +244,7 @@ fn clock_can_and_concurrent_control() {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        c.pause().await.unwrap();
+        assert_eq!(c.pause().await.unwrap(), StatusCode::OK);
         let paused = c.state().await.unwrap();
         assert_eq!(paused.statistics.steps, paused.time_ns / period);
         assert_eq!(paused.statistics.max_catchup_steps, 1);
@@ -417,6 +419,15 @@ fn can_queue_capacity_delivery_and_recovery() {
     let mut sim = Running::start(robot(&mut Command::new(BINARY)), vec![]);
     let bus = bus();
     runtime().block_on(async {
+        // Exceed one CAN receive visit while paused, then drain all replies.
+        // This exercises readiness for frames left behind by the fairness budget.
+        const BURST: u64 = 80;
+        for _ in 0..BURST {
+            bus.write_frame(&frame(0x7ff, QUERY)).unwrap();
+        }
+        for _ in 0..BURST {
+            assert_eq!(bus.read_frame().unwrap().raw_id(), 0x17);
+        }
         tc(&[
             "qdisc", "add", "dev", "bench", "root", "netem", "limit", "10",
         ]);
@@ -438,7 +449,7 @@ fn can_queue_capacity_delivery_and_recovery() {
                 delivered.statistics.replies,
                 delivered.statistics.dropped
             ),
-            (24, 24, 0)
+            (BURST + 24, BURST + 24, 0)
         );
 
         // Hold the same queue full to inject exhaustion, not USB/bus timing.
@@ -480,7 +491,7 @@ fn can_queue_capacity_delivery_and_recovery() {
         let recovered = sim.client.state().await.unwrap().statistics;
         assert_eq!(
             (recovered.commands, recovered.replies, recovered.dropped),
-            (26, 25, 1)
+            (BURST + 26, BURST + 25, 1)
         );
     });
     sim.stop();

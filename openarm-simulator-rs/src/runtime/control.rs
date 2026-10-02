@@ -1,9 +1,10 @@
 use anyhow::Result;
 use openarm_simulator_core::{
-    Advance, AppliedForce, Configuration, FaultRequest, PushRequest, SceneNames, Spring, State,
+    Advance, AppliedForce, BodyPoint, Configuration, FaultRequest, PushRequest, SceneNames, Spring,
+    State,
 };
-use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     io::{self, Write},
     os::unix::net::UnixStream,
     sync::{
@@ -13,17 +14,11 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-// Bounded messages cross into the physics thread; socket I/O never blocks it.
-type Call = (Request, oneshot::Sender<Result<Reply>>);
+pub type Responder<T> = oneshot::Sender<Result<T>>;
 
-pub enum Reply {
-    Names(SceneNames),
-    State(Box<State>),
-    Configuration(Box<Configuration>),
-    Done,
+pub enum Change {
+    Changed,
     Unchanged,
-    Created,
-    Value(Value),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +30,7 @@ pub struct Conflict(pub &'static str);
 pub struct InvalidRequest(pub anyhow::Error);
 
 pub struct Calls {
-    pub(super) receiver: Receiver<Call>,
+    pub(super) receiver: Receiver<Request>,
     pub(super) wake: UnixStream,
 }
 
@@ -45,7 +40,7 @@ pub struct Unavailable(&'static str);
 
 #[derive(Clone)]
 pub struct Control {
-    sender: SyncSender<Call>,
+    sender: SyncSender<Request>,
     wake: Arc<UnixStream>,
 }
 impl Control {
@@ -69,10 +64,10 @@ impl Control {
         signal_hook::low_level::pipe::register(signal, self.wake.try_clone()?)?;
         Ok(())
     }
-    pub async fn call(&self, request: Request) -> Result<Reply> {
+    pub async fn call<T>(&self, request: impl FnOnce(Responder<T>) -> Request) -> Result<T> {
         let (send, receive) = oneshot::channel();
         self.sender
-            .try_send((request, send))
+            .try_send(request(send))
             .map_err(|_| Unavailable("simulator busy or stopped"))?;
         if let Err(error) = (&*self.wake).write_all(&[1])
             && error.kind() != io::ErrorKind::WouldBlock
@@ -92,19 +87,21 @@ impl Control {
 pub struct NotFound(pub(super) String);
 
 pub enum Request {
-    Inspect,
-    Fault { payload: FaultRequest },
-    Push { payload: PushRequest },
-    Reset,
-    Pause,
-    Unpause,
-    Advance { payload: Advance },
-    Configuration,
-    Names,
-    Springs(Option<String>),
-    PutSpring(String, Spring),
-    DeleteSpring(String),
-    Forces(Option<String>),
-    PutForce(String, AppliedForce),
-    DeleteForce(String),
+    Inspect(Responder<State>),
+    Fault(FaultRequest, Responder<State>),
+    Push(PushRequest, Responder<State>),
+    Reset(Responder<()>),
+    Pause(Responder<Change>),
+    Unpause(Responder<Change>),
+    Advance(Advance, Responder<()>),
+    Configuration(Responder<Configuration>),
+    Names(Responder<SceneNames>),
+    Springs(Responder<BTreeMap<String, Spring<BodyPoint>>>),
+    Spring(String, Responder<Spring<BodyPoint>>),
+    PutSpring(String, Spring, Responder<bool>),
+    DeleteSpring(String, Responder<()>),
+    Forces(Responder<BTreeMap<String, AppliedForce<BodyPoint>>>),
+    Force(String, Responder<AppliedForce<BodyPoint>>),
+    PutForce(String, AppliedForce, Responder<bool>),
+    DeleteForce(String, Responder<()>),
 }

@@ -1,4 +1,4 @@
-use super::{Conflict, Control, InvalidRequest, NotFound, Reply, Request as Command, Unavailable};
+use super::{Change, Conflict, Control, InvalidRequest, NotFound, Request as Command, Unavailable};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, FromRequest, Path, Request, State},
@@ -8,7 +8,8 @@ use axum::{
     routing::{get, post},
 };
 use openarm_simulator_core::{
-    Advance, AppliedForce, ErrorResponse, FaultRequest, PushRequest, Spring,
+    Advance, AppliedForce, BodyPoint, Configuration, ErrorResponse, FaultRequest, PushRequest,
+    SceneNames, Spring, State as SimulatorState,
 };
 use serde::de::IgnoredAny;
 use std::{collections::BTreeMap, net::TcpListener, thread, time::Duration};
@@ -19,7 +20,7 @@ use tower_http::{
     timeout::RequestBodyTimeoutLayer,
 };
 
-type Result = std::result::Result<Reply, ApiError>;
+type Result<T> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
@@ -46,20 +47,6 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
-    }
-}
-
-impl IntoResponse for Reply {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Names(value) => Json(value).into_response(),
-            Self::State(value) => Json(value).into_response(),
-            Self::Configuration(value) => Json(value).into_response(),
-            Self::Value(value) => Json(value).into_response(),
-            Self::Done => StatusCode::OK.into_response(),
-            Self::Unchanged => StatusCode::NO_CONTENT.into_response(),
-            Self::Created => StatusCode::CREATED.into_response(),
-        }
     }
 }
 
@@ -138,64 +125,107 @@ fn router(control: Control, origins: Vec<HeaderValue>) -> Router {
         .with_state(control)
 }
 
-async fn state(State(c): State<Control>) -> Result {
-    Ok(c.call(Command::Inspect).await?)
+async fn state(State(c): State<Control>) -> Result<Json<SimulatorState>> {
+    Ok(Json(c.call(Command::Inspect).await?))
 }
-async fn configuration(State(c): State<Control>) -> Result {
-    Ok(c.call(Command::Configuration).await?)
+async fn configuration(State(c): State<Control>) -> Result<Json<Configuration>> {
+    Ok(Json(c.call(Command::Configuration).await?))
 }
-async fn names(State(c): State<Control>) -> Result {
-    Ok(c.call(Command::Names).await?)
+async fn names(State(c): State<Control>) -> Result<Json<SceneNames>> {
+    Ok(Json(c.call(Command::Names).await?))
 }
-async fn reset(State(c): State<Control>, _: EmptyObject) -> Result {
-    Ok(c.call(Command::Reset).await?)
+async fn reset(State(c): State<Control>, _: EmptyObject) -> Result<StatusCode> {
+    c.call(Command::Reset).await?;
+    Ok(StatusCode::OK)
 }
-async fn pause(State(c): State<Control>, _: EmptyObject) -> Result {
-    Ok(c.call(Command::Pause).await?)
+async fn pause(State(c): State<Control>, _: EmptyObject) -> Result<StatusCode> {
+    Ok(clock_status(c.call(Command::Pause).await?))
 }
-async fn unpause(State(c): State<Control>, _: EmptyObject) -> Result {
-    Ok(c.call(Command::Unpause).await?)
+async fn unpause(State(c): State<Control>, _: EmptyObject) -> Result<StatusCode> {
+    Ok(clock_status(c.call(Command::Unpause).await?))
 }
-async fn advance(State(c): State<Control>, Json(payload): Json<Advance>) -> Result {
-    Ok(c.call(Command::Advance { payload }).await?)
+async fn advance(State(c): State<Control>, Json(payload): Json<Advance>) -> Result<StatusCode> {
+    c.call(|reply| Command::Advance(payload, reply)).await?;
+    Ok(StatusCode::OK)
 }
-async fn fault(State(c): State<Control>, Json(payload): Json<FaultRequest>) -> Result {
-    Ok(c.call(Command::Fault { payload }).await?)
+async fn fault(
+    State(c): State<Control>,
+    Json(payload): Json<FaultRequest>,
+) -> Result<Json<SimulatorState>> {
+    Ok(Json(c.call(|reply| Command::Fault(payload, reply)).await?))
 }
-async fn push(State(c): State<Control>, Json(payload): Json<PushRequest>) -> Result {
-    Ok(c.call(Command::Push { payload }).await?)
+async fn push(
+    State(c): State<Control>,
+    Json(payload): Json<PushRequest>,
+) -> Result<Json<SimulatorState>> {
+    Ok(Json(c.call(|reply| Command::Push(payload, reply)).await?))
 }
-async fn forces(State(c): State<Control>) -> Result {
-    Ok(c.call(Command::Forces(None)).await?)
+async fn forces(
+    State(c): State<Control>,
+) -> Result<Json<BTreeMap<String, AppliedForce<BodyPoint>>>> {
+    Ok(Json(c.call(Command::Forces).await?))
 }
-async fn force(State(c): State<Control>, Path(id): Path<String>) -> Result {
-    Ok(c.call(Command::Forces(Some(id))).await?)
+async fn force(
+    State(c): State<Control>,
+    Path(id): Path<String>,
+) -> Result<Json<AppliedForce<BodyPoint>>> {
+    Ok(Json(c.call(|reply| Command::Force(id, reply)).await?))
 }
 async fn put_force(
     State(c): State<Control>,
     Path(id): Path<String>,
     Json(value): Json<AppliedForce>,
-) -> Result {
-    Ok(c.call(Command::PutForce(id, value)).await?)
+) -> Result<StatusCode> {
+    let created = c.call(|reply| Command::PutForce(id, value, reply)).await?;
+    Ok(put_status(created))
 }
-async fn delete_force(State(c): State<Control>, Path(id): Path<String>, _: EmptyObject) -> Result {
-    Ok(c.call(Command::DeleteForce(id)).await?)
+async fn delete_force(
+    State(c): State<Control>,
+    Path(id): Path<String>,
+    _: EmptyObject,
+) -> Result<StatusCode> {
+    c.call(|reply| Command::DeleteForce(id, reply)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
-async fn springs(State(c): State<Control>) -> Result {
-    Ok(c.call(Command::Springs(None)).await?)
+async fn springs(State(c): State<Control>) -> Result<Json<BTreeMap<String, Spring<BodyPoint>>>> {
+    Ok(Json(c.call(Command::Springs).await?))
 }
-async fn spring(State(c): State<Control>, Path(id): Path<String>) -> Result {
-    Ok(c.call(Command::Springs(Some(id))).await?)
+async fn spring(
+    State(c): State<Control>,
+    Path(id): Path<String>,
+) -> Result<Json<Spring<BodyPoint>>> {
+    Ok(Json(c.call(|reply| Command::Spring(id, reply)).await?))
 }
 async fn put_spring(
     State(c): State<Control>,
     Path(id): Path<String>,
     Json(value): Json<Spring>,
-) -> Result {
-    Ok(c.call(Command::PutSpring(id, value)).await?)
+) -> Result<StatusCode> {
+    let created = c.call(|reply| Command::PutSpring(id, value, reply)).await?;
+    Ok(put_status(created))
 }
-async fn delete_spring(State(c): State<Control>, Path(id): Path<String>, _: EmptyObject) -> Result {
-    Ok(c.call(Command::DeleteSpring(id)).await?)
+async fn delete_spring(
+    State(c): State<Control>,
+    Path(id): Path<String>,
+    _: EmptyObject,
+) -> Result<StatusCode> {
+    c.call(|reply| Command::DeleteSpring(id, reply)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn clock_status(change: Change) -> StatusCode {
+    match change {
+        Change::Changed => StatusCode::OK,
+        Change::Unchanged => StatusCode::NO_CONTENT,
+    }
+}
+
+fn put_status(created: bool) -> StatusCode {
+    if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::NO_CONTENT
+    }
 }
 
 pub fn start_http(

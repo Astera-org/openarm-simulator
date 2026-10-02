@@ -1,101 +1,37 @@
 //! Single-threaded simulation/CAN owner. Pausing time never pauses socket I/O.
-use super::{Calls, Clock, Conflict, InvalidRequest, NotFound, Reply, Request, can};
+use super::{Calls, Change, Clock, Conflict, InvalidRequest, NotFound, Request, Responder, can};
 use crate::{physics::Physics, simulation::Simulation};
 use anyhow::{Context, Result, bail, ensure};
 use damiao_can::MotorStatus;
-use openarm_simulator_core::{Configuration, State, Statistics};
-use serde_json::Value;
+use openarm_simulator_core::{Configuration, FaultRequest, State, Statistics};
+use polling::{Event, Events, PollMode, Poller};
 use socketcan::CanFdSocket;
 use std::{
+    fs::File,
     io::{self, Read},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, OwnedFd},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::sync::oneshot;
 
-struct Timer(OwnedFd);
-impl Timer {
-    fn new() -> Result<Self> {
-        let fd = unsafe {
-            libc::timerfd_create(
-                libc::CLOCK_MONOTONIC,
-                libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
-            )
-        };
-        ensure!(fd >= 0, "timerfd_create: {}", io::Error::last_os_error());
-        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
-    }
-    fn arm(&self, first_ns: u64, interval_ns: u64) -> Result<()> {
-        let timespec = |ns: u64| libc::timespec {
-            tv_sec: (ns / 1_000_000_000) as _,
-            tv_nsec: (ns % 1_000_000_000) as _,
-        };
-        let spec = libc::itimerspec {
-            it_interval: timespec(interval_ns),
-            it_value: timespec(first_ns),
-        };
+enum ClockReply {
+    Advance(Responder<()>),
+    Pause(Responder<Change>),
+}
+
+fn set_fault(simulation: &mut Simulation, (name, fault): FaultRequest) -> Result<()> {
+    if let Some(status) = fault.status {
         ensure!(
-            unsafe { libc::timerfd_settime(self.0.as_raw_fd(), 0, &spec, std::ptr::null_mut()) }
-                == 0,
-            "timerfd_settime: {}",
-            io::Error::last_os_error()
+            status.0 <= 15 && status != MotorStatus::ENABLED,
+            "fault status must be 0 or 2..15; enable motors through CAN"
         );
-        Ok(())
     }
-    fn drain(&self) -> Result<()> {
-        let mut count = 0u64;
-        let n = unsafe { libc::read(self.0.as_raw_fd(), (&mut count as *mut u64).cast(), 8) };
-        ensure!(n == 8, "timerfd read: {}", io::Error::last_os_error());
-        Ok(())
+    let motor = simulation.motor_mut(&name)?;
+    if let Some(status) = fault.status {
+        motor.status = status;
     }
-}
-
-fn read_resource<T: serde::Serialize>(
-    values: &std::collections::BTreeMap<String, T>,
-    id: Option<String>,
-) -> Result<Value> {
-    Ok(match id {
-        None => serde_json::to_value(values)?,
-        Some(id) => serde_json::to_value(values.get(&id).ok_or(NotFound(id))?)?,
-    })
-}
-
-fn administer(simulation: &mut Simulation, request: Request) -> Result<()> {
-    match request {
-        Request::Inspect => (),
-        Request::Reset
-        | Request::Pause
-        | Request::Unpause
-        | Request::Advance { .. }
-        | Request::Springs(_)
-        | Request::PutSpring(_, _)
-        | Request::DeleteSpring(_)
-        | Request::Forces(_)
-        | Request::PutForce(_, _)
-        | Request::DeleteForce(_)
-        | Request::Configuration
-        | Request::Names => {
-            unreachable!()
-        }
-        Request::Push { payload } => simulation.push(payload.torques)?,
-        Request::Fault {
-            payload: (name, fault),
-        } => {
-            if let Some(status) = fault.status {
-                ensure!(
-                    status.0 <= 15 && status != MotorStatus::ENABLED,
-                    "fault status must be 0 or 2..15; enable motors through CAN"
-                );
-            }
-            let motor = simulation.motor_mut(&name)?;
-            if let Some(status) = fault.status {
-                motor.status = status;
-            }
-            if let Some(silent) = fault.silent {
-                motor.silent = silent;
-            }
-        }
+    if let Some(silent) = fault.silent {
+        motor.silent = silent;
     }
     Ok(())
 }
@@ -149,64 +85,64 @@ pub fn run(
     parent: Option<OwnedFd>,
     stopped: &AtomicBool,
 ) -> Result<()> {
-    let timer = Timer::new()?;
+    const WAKE: usize = 0;
+    const PARENT: usize = 1;
+    const CAN: usize = 2;
+
+    let mut parent = parent.map(File::from);
+    let poller = Poller::new()?;
+    for (key, fd) in [(WAKE, calls.wake.as_fd())]
+        .into_iter()
+        .chain(parent.as_ref().map(|fd| (PARENT, fd.as_fd())))
+        .chain(
+            sockets
+                .iter()
+                .enumerate()
+                .map(|(i, fd)| (CAN + i, fd.as_fd())),
+        )
+    {
+        // SAFETY: All descriptors outlive this local poller, including on errors.
+        // Level-triggering keeps unread CAN frames ready after a bounded visit.
+        unsafe { poller.add_with_mode(&fd, Event::readable(key), PollMode::Level)? };
+    }
+    let mut events = Events::new();
     let mut clock = Clock::default();
     let timestep_ns = simulation.physics.timestep_ns;
-    let mut advancing: Option<(u64, oneshot::Sender<Result<Reply>>)> = None;
+    let mut advancing: Option<(u64, ClockReply)> = None;
     let mut stats = Statistics::default();
-    let mut pollers = [
-        timer.0.as_raw_fd(),
-        parent.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-        calls.wake.as_raw_fd(),
-    ]
-    .into_iter()
-    .chain(sockets.iter().map(AsRawFd::as_raw_fd))
-    .map(|fd| libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    })
-    .collect::<Vec<_>>();
     while !stopped.load(Ordering::Relaxed) {
-        let behind =
-            clock.elapsed()?.as_nanos() / u128::from(timestep_ns) > u128::from(stats.steps);
-        let timeout = if advancing.is_some() || behind { 0 } else { -1 };
-        let ready = unsafe { libc::poll(pollers.as_mut_ptr(), pollers.len() as _, timeout) };
-        if ready < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            bail!("poll: {}", io::Error::last_os_error());
+        let timeout = if advancing.is_some() {
+            Some(Duration::ZERO)
+        } else if clock.paused() {
+            None
+        } else {
+            let next =
+                Duration::from_nanos(stats.steps * timestep_ns) + Duration::from_nanos(timestep_ns);
+            Some(next.saturating_sub(clock.elapsed()?))
+        };
+        events.clear();
+        poller.wait(&mut events, timeout)?;
+        let ready = |key| events.iter().any(|event| event.key == key);
+
+        if let Some(parent) = parent.as_mut().filter(|_| ready(PARENT))
+            && parent.read(&mut [0])? == 0
+        {
+            break;
         }
-        if pollers[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let mut byte = 0u8;
-            let count = unsafe { libc::read(pollers[1].fd, (&mut byte as *mut u8).cast(), 1) };
-            if count == 0 {
-                break;
-            }
-            ensure!(
-                count == 1,
-                "parent descriptor: {}",
-                io::Error::last_os_error()
-            );
-        }
-        if pollers[2].revents & libc::POLLIN != 0 {
-            let mut bytes = [0; 256];
-            loop {
-                match calls.wake.read(&mut bytes) {
-                    Ok(0) => bail!("administration wake socket closed"),
-                    Ok(_) => (),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e.into()),
-                }
+        if ready(WAKE) {
+            match calls.wake.read(&mut [0; 32]) {
+                Ok(0) => bail!("administration wake socket closed"),
+                Ok(_) => (),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e.into()),
             }
         }
         if stopped.load(Ordering::Relaxed) {
             break;
-        }
-        if pollers[0].revents & libc::POLLIN != 0 {
-            timer.drain()?;
         }
         let mut processed_time_ns = catch_up(simulation, &clock, &mut stats)?;
         if advancing
@@ -214,59 +150,70 @@ pub fn run(
             .is_some_and(|(deadline_ns, _)| processed_time_ns == *deadline_ns)
         {
             let (_, reply) = advancing.take().unwrap();
-            let _ = reply.send(Ok(Reply::Done));
+            match reply {
+                ClockReply::Advance(reply) => {
+                    let _ = reply.send(Ok(()));
+                }
+                ClockReply::Pause(reply) => {
+                    let _ = reply.send(Ok(Change::Changed));
+                }
+            }
         }
         for (bus_index, bus) in sockets.iter().enumerate() {
-            if pollers[bus_index + 3].revents & libc::POLLIN != 0 {
+            if ready(CAN + bus_index) {
                 can::receive(bus, bus_index, simulation, &mut stats)?;
             }
         }
         // The bounded channel limits work here; no timer is needed while paused.
         for _ in 0..32 {
-            let Ok((request, reply)) = calls.receiver.try_recv() else {
+            let Ok(request) = calls.receiver.try_recv() else {
                 break;
             };
-            if advancing.is_some()
-                && matches!(
-                    request,
-                    Request::Reset | Request::Unpause | Request::Advance { .. }
+            let state = |simulation: &Simulation| {
+                snapshot(
+                    simulation,
+                    processed_time_ns,
+                    clock.paused(),
+                    advancing.is_some(),
+                    &stats,
                 )
-            {
-                let _ = reply.send(Err(Conflict("advance already in progress").into()));
-                continue;
-            }
-            let result = match request {
-                Request::Reset => {
+            };
+            match request {
+                Request::Reset(reply) | Request::Advance(_, reply) if advancing.is_some() => {
+                    let _ = reply.send(Err(Conflict("advance already in progress").into()));
+                }
+                Request::Unpause(reply) if advancing.is_some() => {
+                    let _ = reply.send(Err(Conflict("advance already in progress").into()));
+                }
+                Request::Reset(reply) => {
                     simulation.reset()?;
-                    timer.arm(0, 0)?;
                     clock = Clock::default();
                     processed_time_ns = 0;
                     stats = Statistics::default();
-                    Ok(Reply::Done)
+                    let _ = reply.send(Ok(()));
                 }
-                Request::Pause => {
+                Request::Pause(reply) => {
                     if clock.paused() {
-                        Ok(Reply::Unchanged)
+                        let _ = reply.send(Ok(Change::Unchanged));
                     } else {
-                        timer.arm(0, 0)?;
                         clock.pause()?;
                         let deadline_ns = u64::try_from(clock.elapsed()?.as_nanos())?;
-                        advancing = Some((deadline_ns, reply));
-                        continue;
+                        advancing = Some((deadline_ns, ClockReply::Pause(reply)));
                     }
                 }
-                Request::Unpause => {
-                    if clock.paused() {
-                        timer.arm(timestep_ns - processed_time_ns % timestep_ns, timestep_ns)?;
+                Request::Unpause(reply) => {
+                    let change = if clock.paused() {
                         clock.unpause();
-                        Ok(Reply::Done)
+                        Change::Changed
                     } else {
-                        Ok(Reply::Unchanged)
-                    }
+                        Change::Unchanged
+                    };
+                    let _ = reply.send(Ok(change));
                 }
-                Request::Advance { payload } => {
+                Request::Advance(payload, reply) => {
                     if !clock.paused() {
-                        Err(Conflict("pause the clock before advancing").into())
+                        let _ =
+                            reply.send(Err(Conflict("pause the clock before advancing").into()));
                     } else {
                         match processed_time_ns
                             .checked_add(payload.duration_ns)
@@ -274,73 +221,70 @@ pub fn run(
                         {
                             Ok(deadline_ns) => {
                                 clock.advance(Duration::from_nanos(payload.duration_ns))?;
-                                advancing = Some((deadline_ns, reply));
-                                continue;
+                                advancing = Some((deadline_ns, ClockReply::Advance(reply)));
                             }
-                            Err(error) => Err(InvalidRequest(error).into()),
+                            Err(error) => {
+                                let _ = reply.send(Err(InvalidRequest(error).into()));
+                            }
                         }
                     }
                 }
-                Request::Names => Ok(Reply::Names(simulation.physics.names())),
-                Request::Configuration => Ok(Reply::Configuration(Box::new(Configuration {
-                    configuration: simulation.physics.configuration(),
-                }))),
-                Request::Springs(id) => {
-                    read_resource(simulation.physics.springs(), id).map(Reply::Value)
+                Request::Inspect(reply) => {
+                    let _ = reply.send(Ok(state(simulation)));
                 }
-                Request::Forces(id) => {
-                    read_resource(simulation.physics.forces(), id).map(Reply::Value)
+                Request::Names(reply) => {
+                    let _ = reply.send(Ok(simulation.physics.names()));
                 }
-                Request::PutSpring(id, value) => simulation
-                    .physics
-                    .put_spring(id, value)
-                    .map_err(|e| InvalidRequest(e).into())
-                    .map(|created| {
-                        if created {
-                            Reply::Created
-                        } else {
-                            Reply::Unchanged
-                        }
-                    }),
-                Request::PutForce(id, value) => simulation
-                    .physics
-                    .put_force(id, value)
-                    .map_err(|e| InvalidRequest(e).into())
-                    .map(|created| {
-                        if created {
-                            Reply::Created
-                        } else {
-                            Reply::Unchanged
-                        }
-                    }),
-                Request::DeleteSpring(id) => {
+                Request::Configuration(reply) => {
+                    let _ = reply.send(Ok(Configuration {
+                        configuration: simulation.physics.configuration(),
+                    }));
+                }
+                Request::Springs(reply) => {
+                    let _ = reply.send(Ok(simulation.physics.springs().clone()));
+                }
+                Request::Spring(id, reply) => {
+                    let value = simulation.physics.springs().get(&id).cloned();
+                    let _ = reply.send(value.ok_or_else(|| NotFound(id).into()));
+                }
+                Request::Forces(reply) => {
+                    let _ = reply.send(Ok(simulation.physics.forces().clone()));
+                }
+                Request::Force(id, reply) => {
+                    let value = simulation.physics.forces().get(&id).cloned();
+                    let _ = reply.send(value.ok_or_else(|| NotFound(id).into()));
+                }
+                Request::PutSpring(id, value, reply) => {
+                    let result = simulation.physics.put_spring(id, value);
+                    let _ = reply.send(result.map_err(|e| InvalidRequest(e).into()));
+                }
+                Request::PutForce(id, value, reply) => {
+                    let result = simulation.physics.put_force(id, value);
+                    let _ = reply.send(result.map_err(|e| InvalidRequest(e).into()));
+                }
+                Request::DeleteSpring(id, reply) => {
                     simulation.physics.delete_spring(&id);
-                    Ok(Reply::Unchanged)
+                    let _ = reply.send(Ok(()));
                 }
-                Request::DeleteForce(id) => {
+                Request::DeleteForce(id, reply) => {
                     simulation.physics.delete_force(&id);
-                    Ok(Reply::Unchanged)
+                    let _ = reply.send(Ok(()));
                 }
-                request => administer(simulation, request)
-                    .map_err(|e| InvalidRequest(e).into())
-                    .map(|()| {
-                        Reply::State(Box::new(snapshot(
-                            simulation,
-                            processed_time_ns,
-                            clock.paused(),
-                            advancing.is_some(),
-                            &stats,
-                        )))
-                    }),
-            };
-            let _ = reply.send(result);
+                Request::Fault(payload, reply) => {
+                    let result = set_fault(simulation, payload)
+                        .map_err(|e| InvalidRequest(e).into())
+                        .map(|()| state(simulation));
+                    let _ = reply.send(result);
+                }
+                Request::Push(payload, reply) => {
+                    let result = simulation
+                        .push(payload.torques)
+                        .map_err(|e| InvalidRequest(e).into())
+                        .map(|()| state(simulation));
+                    let _ = reply.send(result);
+                }
+            }
         }
-        ensure!(
-            pollers
-                .iter()
-                .all(|p| p.revents & (libc::POLLERR | libc::POLLNVAL) == 0),
-            "simulator descriptor failed"
-        );
     }
     Ok(())
 }
