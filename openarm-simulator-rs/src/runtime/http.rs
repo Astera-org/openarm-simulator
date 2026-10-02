@@ -1,31 +1,55 @@
 use super::{Conflict, Control, NotFound, Reply, Request as AdminRequest, Unavailable};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
-    Method, Request, Response, StatusCode,
-    body::{Bytes, Incoming},
-    header,
+    HeaderMap, Method, Request, Response, StatusCode,
+    body::{Body, Bytes, Incoming},
+    header::{self, HeaderValue},
     server::conn::http1,
     service::service_fn,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use openarm_simulator_core::ErrorResponse;
 use serde_json::{Value, json};
-use std::{convert::Infallible, net::TcpListener, thread, time::Duration};
+use std::{convert::Infallible, net::TcpListener, sync::Arc, thread, time::Duration};
 use tokio::time::timeout;
+
+// Require application/json so cross-origin browser requests need preflight
+// approval before executing commands. Simple requests, including empty POSTs,
+// can otherwise execute even when CORS blocks reading the response. See:
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS#simple_requests
+fn require_json(headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
+    let media = headers
+        .get(header::CONTENT_TYPE)
+        .map(|v| v.to_str())
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .unwrap_or("");
+    if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
+        || !media
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+    {
+        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    Ok(())
+}
 
 async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(StatusCode, Value)> {
     let headers = request.headers();
-    if headers.contains_key(header::ORIGIN) {
-        return Ok((
-            StatusCode::FORBIDDEN,
-            json!({"error": "Browser-origin requests are not enabled"}),
-        ));
-    }
     if headers.contains_key(header::EXPECT) {
         return Ok((
             StatusCode::EXPECTATION_FAILED,
             json!({"error": "Expect is not supported"}),
+        ));
+    }
+    if let Err(status) = require_json(headers) {
+        return Ok((
+            status,
+            json!({"error": "Use Content-Type: application/json"}),
         ));
     }
     let path = request.uri().path().to_owned();
@@ -52,42 +76,21 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
     };
     let mut payload = Value::Null;
     if matches!(method, Method::POST | Method::PUT | Method::DELETE) {
-        ensure!(
-            headers.get_all(header::CONTENT_LENGTH).iter().count() <= 1
-                && !headers.contains_key(header::TRANSFER_ENCODING),
-            "Supply Content-Length; chunked requests are not supported"
-        );
-        let length: usize = headers
-            .get(header::CONTENT_LENGTH)
-            .map(|v| v.to_str())
-            .transpose()?
-            .unwrap_or("0")
-            .parse()?;
+        let length = request
+            .body()
+            .size_hint()
+            .exact()
+            .context("Supply Content-Length; chunked requests are not supported")?;
         if length > 16384 {
             return Ok((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 json!({"error": "Request body exceeds 16384 bytes"}),
             ));
         }
-        ensure!(no_args || length > 0, "request requires a JSON body");
-        let media = headers
-            .get(header::CONTENT_TYPE)
-            .map(|v| v.to_str())
-            .transpose()?
-            .unwrap_or("");
-        if length > 0
-            && !media
-                .split(';')
-                .next()
-                .unwrap()
-                .trim()
-                .eq_ignore_ascii_case("application/json")
-        {
-            return Ok((
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                json!({"error": "Use Content-Type: application/json"}),
-            ));
-        }
+        ensure!(
+            length > 0,
+            "request requires a JSON body; use an empty object for no arguments"
+        );
         let body = match timeout(
             Duration::from_secs(2),
             Limited::new(request.into_body(), 16384).collect(),
@@ -103,15 +106,11 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
                 ));
             }
         };
-        ensure!(body.len() == length, "incomplete request body");
-        if no_args {
-            ensure!(
-                body.is_empty() || serde_json::from_slice::<Value>(&body)? == json!({}),
-                "{path} takes no arguments"
-            );
-        } else {
-            payload = serde_json::from_slice(&body)?;
-        }
+        payload = serde_json::from_slice(&body)?;
+        ensure!(
+            !no_args || payload == json!({}),
+            "{path} takes an empty JSON object"
+        );
     }
     let message = if let Some((collection, id)) = resource_path {
         let id = id
@@ -183,8 +182,21 @@ async fn dispatch(request: Request<Incoming>, control: Control) -> Result<(Statu
 async fn handle(
     request: Request<Incoming>,
     control: Control,
+    allowed_origins: Arc<[HeaderValue]>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let (status, value) = dispatch(request, control).await.unwrap_or_else(|error| {
+    let origin = request.headers().get(header::ORIGIN).and_then(|origin| {
+        allowed_origins
+            .iter()
+            .find(|allowed| *allowed == origin || allowed.as_bytes() == b"*")
+            .cloned()
+    });
+    let preflight = request.method() == Method::OPTIONS;
+    let result = if preflight {
+        Ok((StatusCode::NO_CONTENT, Value::Null))
+    } else {
+        dispatch(request, control).await
+    };
+    let (status, value) = result.unwrap_or_else(|error: anyhow::Error| {
         let status = if error.is::<Unavailable>() {
             StatusCode::SERVICE_UNAVAILABLE
         } else if error.is::<Conflict>() {
@@ -204,7 +216,19 @@ async fn handle(
     });
     let mut response = Response::builder()
         .status(status)
+        .header(header::VARY, "Origin")
         .header(header::CACHE_CONTROL, "no-store");
+    if let Some(origin) = origin {
+        response = response.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        if preflight {
+            response = response
+                .header(
+                    header::ACCESS_CONTROL_ALLOW_METHODS,
+                    "GET, POST, PUT, DELETE",
+                )
+                .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type");
+        }
+    }
     // Errors may reject an unread body. Let Hyper close without reusing it as
     // the next request; successful requests retain normal HTTP/1.1 keep-alive.
     if !status.is_success() {
@@ -219,7 +243,12 @@ async fn handle(
     Ok(response.body(Full::new(body)).unwrap())
 }
 
-pub fn start_http(listener: TcpListener, control: Control) -> Result<()> {
+pub fn start_http(
+    listener: TcpListener,
+    control: Control,
+    allowed_origins: Vec<HeaderValue>,
+) -> Result<()> {
+    let allowed_origins: Arc<[HeaderValue]> = allowed_origins.into();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -242,6 +271,7 @@ pub fn start_http(listener: TcpListener, control: Control) -> Result<()> {
                         }
                     };
                     let control = control.clone();
+                    let allowed_origins = allowed_origins.clone();
                     tokio::spawn(async move {
                         let _ = http1::Builder::new()
                             .keep_alive(true)
@@ -251,7 +281,9 @@ pub fn start_http(listener: TcpListener, control: Control) -> Result<()> {
                             .max_buf_size(8192)
                             .serve_connection(
                                 TokioIo::new(stream),
-                                service_fn(move |request| handle(request, control.clone())),
+                                service_fn(move |request| {
+                                    handle(request, control.clone(), allowed_origins.clone())
+                                }),
                             )
                             .await;
                     });
@@ -259,4 +291,36 @@ pub fn start_http(listener: TcpListener, control: Control) -> Result<()> {
             })
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_json_content_type() {
+        let rejected = Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        for (values, expected) in [
+            (vec!["application/json"], Ok(())),
+            (vec![" Application/JSON ; charset=utf-8 "], Ok(())),
+            (vec![], rejected),
+            (vec!["text/plain"], rejected),
+            (vec!["application/x-www-form-urlencoded"], rejected),
+            (vec!["multipart/form-data; boundary=test"], rejected),
+            (vec!["application/json, text/plain"], rejected),
+            (vec!["application/json", "application/json"], rejected),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in &values {
+                headers.append(header::CONTENT_TYPE, HeaderValue::from_static(value));
+            }
+            assert_eq!(require_json(&headers), expected, "{values:?}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(require_json(&headers), Err(StatusCode::BAD_REQUEST));
+    }
 }

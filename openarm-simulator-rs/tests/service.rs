@@ -7,6 +7,7 @@ use socketcan::{
     SocketOptions, StandardId,
 };
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -22,7 +23,10 @@ use std::{
 
 const BINARY: &str = env!("CARGO_BIN_EXE_openarm-simulator");
 
-fn http_response(reader: &mut BufReader<TcpStream>, status: u16) -> Value {
+fn http_response(
+    reader: &mut BufReader<TcpStream>,
+    status: u16,
+) -> (BTreeMap<String, String>, Value) {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     assert_eq!(
@@ -34,7 +38,7 @@ fn http_response(reader: &mut BufReader<TcpStream>, status: u16) -> Value {
         status,
         "{line}"
     );
-    let mut length = None;
+    let mut headers = BTreeMap::new();
     loop {
         line.clear();
         assert!(
@@ -44,26 +48,24 @@ fn http_response(reader: &mut BufReader<TcpStream>, status: u16) -> Value {
         if line == "\r\n" {
             break;
         }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("Content-Length")
-        {
-            length = Some(value.trim().parse::<usize>().unwrap());
-        }
+        let (name, value) = line.split_once(':').unwrap();
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
     }
     let mut body = vec![
         0;
         if status == 204 {
             0
         } else {
-            length.expect("response Content-Length")
+            headers["content-length"].parse::<usize>().unwrap()
         }
     ];
     reader.read_exact(&mut body).unwrap();
-    if body.is_empty() {
+    let body = if body.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&body).unwrap()
-    }
+    };
+    (headers, body)
 }
 
 fn command(config: &str) -> Command {
@@ -140,6 +142,16 @@ impl Running {
         self.wait();
     }
     fn request(&self, method: &str, path: &str, body: &str, headers: &str, status: u16) -> Value {
+        self.exchange(method, path, body, headers, status).1
+    }
+    fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        headers: &str,
+        status: u16,
+    ) -> (BTreeMap<String, String>, Value) {
         let mut stream = TcpStream::connect(self.1).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -157,10 +169,10 @@ impl Running {
         http_response(&mut BufReader::new(stream), status)
     }
     fn get(&self, path: &str) -> Value {
-        self.request("GET", path, "", "", 200)
+        self.request("GET", path, "", "Content-Type: application/json\r\n", 200)
     }
     fn clock(&self, path: &str, status: u16) {
-        assert_eq!(self.request("POST", path, "", "", status), Value::Null);
+        assert_eq!(self.post(path, json!({}), status), Value::Null);
     }
     fn advance(&self, duration_ns: u64) {
         assert_eq!(
@@ -388,6 +400,20 @@ fn can_http_and_lifecycle() {
         };
         let mut cmd = command(openarm_test_model::CONFIG);
         cmd.args(["--model", model, "--port", "0"]);
+        match mode {
+            1 => {
+                cmd.args([
+                    "--allow-origin",
+                    "https://unused.example",
+                    "--allow-origin",
+                    "http://localhost:5173",
+                ]);
+            }
+            2 => {
+                cmd.args(["--allow-origin", "*"]);
+            }
+            _ => {}
+        }
         if mode != 0 {
             cmd.args([
                 "--can-interface",
@@ -453,7 +479,9 @@ fn can_http_and_lifecycle() {
         ] {
             service.request("POST", "/reset", "{}", headers, 400);
         }
-        for raw in ["{\"right\":[NaN]}", "{"] {
+        service.advance(1);
+        let before = service.get("/state");
+        for raw in ["{\"right\":[NaN]}", "{", "", "null", "[]"] {
             service.request(
                 "POST",
                 "/reset",
@@ -462,7 +490,9 @@ fn can_http_and_lifecycle() {
                 400,
             );
         }
+        service.request("POST", "/reset", "", "", 415);
         service.request("POST", "/reset", "{}", "Content-Type: text/plain\r\n", 415);
+        service.request("GET", "/state", "", "", 415);
         service.request(
             "POST",
             "/reset",
@@ -470,13 +500,48 @@ fn can_http_and_lifecycle() {
             "Content-Type: application/json\r\n",
             413,
         );
-        service.request(
-            "POST",
-            "/reset",
-            "{}",
-            "Origin: https://example.com\r\n",
-            403,
-        );
+        for origin in ["http://localhost:5173", "https://other.example"] {
+            let allowed = mode == 2 || (mode == 1 && origin == "http://localhost:5173");
+            let expected = allowed.then_some(if mode == 2 { "*" } else { origin });
+            let (headers, body) = service.exchange("OPTIONS", "/reset", "", &format!("Origin: {origin}\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\n"), 204);
+            assert_eq!(body, Value::Null);
+            assert_eq!(
+                headers
+                    .get("access-control-allow-origin")
+                    .map(String::as_str),
+                expected
+            );
+            assert_eq!(
+                headers
+                    .get("access-control-allow-methods")
+                    .map(String::as_str),
+                allowed.then_some("GET, POST, PUT, DELETE")
+            );
+            assert_eq!(
+                headers
+                    .get("access-control-allow-headers")
+                    .map(String::as_str),
+                allowed.then_some("Content-Type")
+            );
+            for (path, body, status) in [("/pause", "{}", 204), ("/reset", "{\"invalid\":1}", 400)]
+            {
+                let (headers, _) = service.exchange(
+                    "POST",
+                    path,
+                    body,
+                    &format!("Origin: {origin}\r\nContent-Type: application/json\r\n"),
+                    status,
+                );
+                assert_eq!(
+                    headers
+                        .get("access-control-allow-origin")
+                        .map(String::as_str),
+                    expected
+                );
+                assert_eq!(headers["vary"], "Origin");
+            }
+        }
+        assert_eq!(service.get("/state"), before);
         service.post("/command", json!({}), 404);
         service.post("/step", json!({}), 404);
         let joint = service.get("/names")["joints"]["openarm_right_joint7"]
@@ -527,10 +592,10 @@ fn can_http_and_lifecycle() {
                         for path in ["/state", "/configuration", "/state"] {
                             write!(
                                 reader.get_mut(),
-                                "GET {path} HTTP/1.1\r\nHost: {address}\r\n\r\n"
+                                "GET {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\r\n"
                             )
                             .unwrap();
-                            let value = http_response(&mut reader, 200);
+                            let (_, value) = http_response(&mut reader, 200);
                             assert!(value.get(path.trim_start_matches('/')).is_some());
                         }
                     });
@@ -542,6 +607,7 @@ fn can_http_and_lifecycle() {
             );
             assert!(
                 http_response(&mut BufReader::new(stalled), 408)
+                    .1
                     .get("error")
                     .is_some()
             );
@@ -863,8 +929,8 @@ fn can_and_shutdown_remain_live_during_advance() {
         can_command(&bus, [7, 0, 0xcc, 0, 0, 0, 0, 0], 0x7ff, 0);
     }
     service.post("/advance", json!({"duration_ns": 1}), 409);
-    service.request("POST", "/unpause", "", "", 409);
-    service.request("POST", "/reset", "", "", 409);
+    service.post("/unpause", json!({}), 409);
+    service.post("/reset", json!({}), 409);
     assert_eq!(service.get("/state")["advancing"], true);
     service.terminate();
 }

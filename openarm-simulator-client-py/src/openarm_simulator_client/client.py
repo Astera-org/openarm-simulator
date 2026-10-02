@@ -77,15 +77,15 @@ class Client:
 
     def reset(self) -> HTTPStatus:
         """Restore startup state and pause the clock."""
-        return self._request("POST", "/reset", None)
+        return self._request("POST", "/reset", None, {})
 
     def pause(self) -> HTTPStatus:
         """200 when changed; 204 when already paused."""
-        return self._request("POST", "/pause", None)
+        return self._request("POST", "/pause", None, {})
 
     def unpause(self) -> HTTPStatus:
         """200 when changed; 204 when already unpaused."""
-        return self._request("POST", "/unpause", None)
+        return self._request("POST", "/unpause", None, {})
 
     def advance(self, duration_ns: int) -> HTTPStatus:
         """Advance a paused clock without wall pacing; carry incomplete intervals.
@@ -114,7 +114,7 @@ class Client:
         return self._request("PUT", _resource_path("springs", id), None, spring)
 
     def delete_spring(self, id: str) -> HTTPStatus:
-        return self._request("DELETE", _resource_path("springs", id), None)
+        return self._request("DELETE", _resource_path("springs", id), None, {})
 
     def forces(self) -> dict[str, AppliedForce]:
         return self._request("GET", "/forces", dict[str, AppliedForce])
@@ -126,7 +126,7 @@ class Client:
         return self._request("PUT", _resource_path("forces", id), None, force)
 
     def delete_force(self, id: str) -> HTTPStatus:
-        return self._request("DELETE", _resource_path("forces", id), None)
+        return self._request("DELETE", _resource_path("forces", id), None, {})
 
 
 def _resource_path(collection: str, id: str) -> str:

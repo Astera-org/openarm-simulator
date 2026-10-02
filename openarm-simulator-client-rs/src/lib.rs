@@ -21,6 +21,8 @@ use models::{
 pub use openarm_simulator_core as models;
 use std::collections::BTreeMap;
 
+const EMPTY_JSON_OBJECT: &[u8] = b"{}";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("simulator HTTP {status}: {message}")]
@@ -161,8 +163,12 @@ impl Client {
         .await
     }
     pub async fn delete_spring(&self, id: &str) -> Result<StatusCode> {
-        self.edit(Method::DELETE, &resource_path("springs", id)?, Vec::new())
-            .await
+        self.edit(
+            Method::DELETE,
+            &resource_path("springs", id)?,
+            EMPTY_JSON_OBJECT.to_vec(),
+        )
+        .await
     }
     pub async fn forces(&self) -> Result<BTreeMap<String, AppliedForce>> {
         self.read(Method::GET, "/forces", Vec::new()).await
@@ -180,8 +186,12 @@ impl Client {
         .await
     }
     pub async fn delete_force(&self, id: &str) -> Result<StatusCode> {
-        self.edit(Method::DELETE, &resource_path("forces", id)?, Vec::new())
-            .await
+        self.edit(
+            Method::DELETE,
+            &resource_path("forces", id)?,
+            EMPTY_JSON_OBJECT.to_vec(),
+        )
+        .await
     }
     async fn edit(&self, method: Method, path: &str, body: Vec<u8>) -> Result<StatusCode> {
         let (status, bytes) = self.request(method, path, body).await?;
@@ -195,15 +205,15 @@ impl Client {
     }
     /// Restore startup state and pause the clock.
     pub async fn reset(&self) -> Result<StatusCode> {
-        self.clock("/reset", Vec::new()).await
+        self.clock("/reset", EMPTY_JSON_OBJECT.to_vec()).await
     }
     /// Returns 200 when changed, 204 when already paused.
     pub async fn pause(&self) -> Result<StatusCode> {
-        self.clock("/pause", Vec::new()).await
+        self.clock("/pause", EMPTY_JSON_OBJECT.to_vec()).await
     }
     /// Returns 200 when changed, 204 when already unpaused.
     pub async fn unpause(&self) -> Result<StatusCode> {
-        self.clock("/unpause", Vec::new()).await
+        self.clock("/unpause", EMPTY_JSON_OBJECT.to_vec()).await
     }
     /// Advance the paused clock. Uses integer nanoseconds without partial physics
     /// updates. Coordinate CAN exchanges separately; this does not drain consumers.
@@ -246,4 +256,15 @@ fn resource_path(collection: &str, id: &str) -> Result<String> {
         "/{collection}/{}",
         percent_encoding::utf8_percent_encode(id, percent_encoding::NON_ALPHANUMERIC)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn empty_json_object_matches_serde() {
+        assert_eq!(
+            super::EMPTY_JSON_OBJECT,
+            serde_json::to_vec(&serde_json::json!({})).unwrap()
+        );
+    }
 }

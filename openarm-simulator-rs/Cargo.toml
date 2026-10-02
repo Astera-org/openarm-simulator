@@ -11,7 +11,7 @@ openarm-simulator-core = { path = "../openarm-simulator-core-rs" }
 mujoco = { path = "../mujoco-rs" }
 damiao-can = { path = "../damiao-can-rs" }
 anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

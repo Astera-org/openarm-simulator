@@ -4,6 +4,7 @@ mod runtime;
 mod simulation;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
+use hyper::header::HeaderValue;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -17,16 +18,34 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "MuJoCo scene with configured Damiao CAN motors and HTTP administration",
-    after_help = "Motor commands use CAN only. Supply --config with named buses and motors; see config/openarm-v1.json for the OpenArm setup and models/openarm-v1.xml for its shaft transmissions. A binding's actuator transmission length represents shaft angle in radians. HTTP: GET /state, GET /configuration, POST /fault, /push, /reset, /pause, /unpause, /advance.\nClock starts paused; reset restores startup state and pauses. POST /advance accepts {\"duration_ns\": <integer>} while paused. Clock mutations return empty 200 responses, or 204 for an unchanged pause/unpause; 409 means clock state conflict.\nInherited descriptors must survive exec. HTTP also accepts LISTEN_FDS=1, LISTEN_PID, and LISTEN_FDS_FIRST_FD (default 3).\nBuild: cargo build --release (downloads pinned MuJoCo unless MUJOCO_DIR is set).\nTests: cargo test (also provisions the pinned model; requires Linux user/network namespaces, vcan and iproute2)."
+    about = "Test robot control software against simulated CAN motors and MuJoCo physics",
+    after_help = r#"The simulator emulates Damiao motor controllers so your control software can
+communicate over CAN as it does with a robot. The HTTP API lets you inspect state,
+control simulated time, inject motor faults, and apply forces or springs.
+
+Supply a MuJoCo scene with --model. Use --config to define the simulated motors
+and their CAN interfaces.
+
+The simulation starts paused. Use the HTTP API to unpause for real-time execution
+or advance time explicitly while paused. Reset restores the startup state and
+pauses again.
+
+Rust and Python clients are included. Web applications can connect directly when
+their origin is permitted with --allow-origin. See README.md for HTTP usage."#
 )]
 struct Args {
-    #[arg(long, env = "OPENARM_SIMULATOR_MODEL")]
+    /// MuJoCo scene to simulate (MJCF file)
+    #[arg(long)]
     model: PathBuf,
+    /// Listen address for the HTTP control API
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+    /// Listen port for the HTTP control API
     #[arg(long, default_value_t = 8080)]
     port: u16,
+    /// Allowed web origin (repeatable), or '*' for any origin; none by default
+    #[arg(long)]
+    allow_origin: Vec<HeaderValue>,
     /// Inherited listening TCP socket; overrides host/port
     #[arg(long)]
     http_fd: Option<RawFd>,
@@ -39,6 +58,7 @@ struct Args {
     /// Readable pipe/socket; EOF stops the simulator
     #[arg(long)]
     parent_fd: Option<RawFd>,
+    /// JSON configuration for motors, CAN buses, and physics
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -116,7 +136,7 @@ fn main() -> Result<()> {
         signal_hook::flag::register(signal, Arc::clone(&stopped))?;
         control.wake_on_signal(signal)?;
     }
-    runtime::start_http(listener, control)?;
+    runtime::start_http(listener, control, args.allow_origin)?;
     println!("HTTP administration: http://{address}");
     std::io::stdout().flush()?;
     runtime::run(&mut simulation, calls, buses, parent, &stopped)?;
