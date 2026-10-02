@@ -1,188 +1,209 @@
-use super::{Conflict, Control, NotFound, Reply, Request as AdminRequest, Unavailable};
-use anyhow::{Result, ensure};
+use super::{Conflict, Control, InvalidRequest, NotFound, Reply, Request as Command, Unavailable};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Request, State},
-    http::{
-        HeaderMap, Method, StatusCode,
-        header::{self, HeaderValue},
-    },
+    extract::{DefaultBodyLimit, FromRequest, Path, Request, State},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use openarm_simulator_core::ErrorResponse;
-use serde_json::{Map, Value};
-use std::{net::TcpListener, thread, time::Duration};
+use openarm_simulator_core::{
+    Advance, AppliedForce, ErrorResponse, FaultRequest, PushRequest, Spring,
+};
+use serde::de::IgnoredAny;
+use std::{collections::BTreeMap, net::TcpListener, thread, time::Duration};
+use tower::ServiceBuilder;
 use tower_http::{
     cors::{Any, CorsLayer},
     set_header::SetResponseHeaderLayer,
     timeout::RequestBodyTimeoutLayer,
 };
 
-// Require application/json so cross-origin browser requests need preflight
-// approval before executing commands. Simple requests, including empty POSTs,
-// can otherwise execute even when CORS blocks reading the response. See:
-// https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS#simple_requests
-fn require_json(headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
+type Result = std::result::Result<Reply, ApiError>;
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct ApiError(#[from] anyhow::Error);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = if self.0.is::<InvalidRequest>() {
+            StatusCode::BAD_REQUEST
+        } else if self.0.is::<Conflict>() {
+            StatusCode::CONFLICT
+        } else if self.0.is::<NotFound>() {
+            StatusCode::NOT_FOUND
+        } else if self.0.is::<Unavailable>() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            eprintln!("HTTP administration: {:#}", self.0);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        (
+            status,
+            Json(ErrorResponse {
+                error: self.to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+impl IntoResponse for Reply {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Names(value) => Json(value).into_response(),
+            Self::State(value) => Json(value).into_response(),
+            Self::Configuration(value) => Json(value).into_response(),
+            Self::Value(value) => Json(value).into_response(),
+            Self::Done => StatusCode::OK.into_response(),
+            Self::Unchanged => StatusCode::NO_CONTENT.into_response(),
+            Self::Created => StatusCode::CREATED.into_response(),
+        }
+    }
+}
+
+struct EmptyObject;
+impl<S: Send + Sync> FromRequest<S> for EmptyObject {
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> std::result::Result<Self, Response> {
+        let Json(fields) = Json::<BTreeMap<String, IgnoredAny>>::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if !fields.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "expected an empty JSON object").into_response());
+        }
+        Ok(Self)
+    }
+}
+
+// Require JSON so browsers must obtain preflight approval before executing
+// commands. CORS alone only hides responses to simple requests, which can still
+// have side effects. See https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS#simple_requests
+async fn require_json(request: Request, next: Next) -> std::result::Result<Response, StatusCode> {
+    let headers = request.headers();
     let media = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<mime::Mime>().ok());
+        .and_then(|value| value.parse::<mime::Mime>().ok());
     if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
         || media.is_none_or(|media| media.essence_str() != "application/json")
     {
         return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
-    Ok(())
+    Ok(next.run(request).await)
 }
 
-async fn command(control: Control, args: Map<String, Value>, request: AdminRequest) -> Response {
-    let request = (|| {
-        ensure!(args.is_empty(), "command takes an empty JSON object");
-        Ok(request)
-    })();
-    call(control, request).await
+fn router(control: Control, origins: Vec<HeaderValue>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE]);
+    let cors = if origins.iter().any(|origin| origin == "*") {
+        cors.allow_origin(Any)
+    } else {
+        cors.allow_origin(origins)
+    };
+    Router::new()
+        .route("/state", get(state))
+        .route("/configuration", get(configuration))
+        .route("/names", get(names))
+        .route("/reset", post(reset))
+        .route("/pause", post(pause))
+        .route("/unpause", post(unpause))
+        .route("/advance", post(advance))
+        .route("/fault", post(fault))
+        .route("/push", post(push))
+        .route("/forces", get(forces))
+        .route(
+            "/forces/{id}",
+            get(force).put(put_force).delete(delete_force),
+        )
+        .route("/springs", get(springs))
+        .route(
+            "/springs/{id}",
+            get(spring).put(put_spring).delete(delete_spring),
+        )
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-store"),
+                ))
+                .layer(cors)
+                .layer(middleware::from_fn(require_json))
+                .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(2)))
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .with_state(control)
 }
 
-async fn call(control: Control, request: Result<AdminRequest>) -> Response {
-    // Waiting for the physics owner must not block the network event loop.
-    let result = tokio::task::spawn_blocking(move || control.call(request?))
-        .await
-        .unwrap_or_else(|error| Err(error.into()));
-    match result {
-        Ok(Reply::Names(value)) => Json(value).into_response(),
-        Ok(Reply::State(value)) => Json(value).into_response(),
-        Ok(Reply::Configuration(value)) => Json(value).into_response(),
-        Ok(Reply::Done) => StatusCode::OK.into_response(),
-        Ok(Reply::Unchanged) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Reply::Created) => StatusCode::CREATED.into_response(),
-        Ok(Reply::Value(value)) => Json(value).into_response(),
-        Err(error) => {
-            let status = if error.is::<Unavailable>() {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else if error.is::<Conflict>() {
-                StatusCode::CONFLICT
-            } else if error.is::<NotFound>() {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (
-                status,
-                Json(ErrorResponse {
-                    error: error.to_string(),
-                }),
-            )
-                .into_response()
-        }
-    }
+async fn state(State(c): State<Control>) -> Result {
+    Ok(c.call(Command::Inspect).await?)
+}
+async fn configuration(State(c): State<Control>) -> Result {
+    Ok(c.call(Command::Configuration).await?)
+}
+async fn names(State(c): State<Control>) -> Result {
+    Ok(c.call(Command::Names).await?)
+}
+async fn reset(State(c): State<Control>, _: EmptyObject) -> Result {
+    Ok(c.call(Command::Reset).await?)
+}
+async fn pause(State(c): State<Control>, _: EmptyObject) -> Result {
+    Ok(c.call(Command::Pause).await?)
+}
+async fn unpause(State(c): State<Control>, _: EmptyObject) -> Result {
+    Ok(c.call(Command::Unpause).await?)
+}
+async fn advance(State(c): State<Control>, Json(payload): Json<Advance>) -> Result {
+    Ok(c.call(Command::Advance { payload }).await?)
+}
+async fn fault(State(c): State<Control>, Json(payload): Json<FaultRequest>) -> Result {
+    Ok(c.call(Command::Fault { payload }).await?)
+}
+async fn push(State(c): State<Control>, Json(payload): Json<PushRequest>) -> Result {
+    Ok(c.call(Command::Push { payload }).await?)
+}
+async fn forces(State(c): State<Control>) -> Result {
+    Ok(c.call(Command::Forces(None)).await?)
+}
+async fn force(State(c): State<Control>, Path(id): Path<String>) -> Result {
+    Ok(c.call(Command::Forces(Some(id))).await?)
+}
+async fn put_force(
+    State(c): State<Control>,
+    Path(id): Path<String>,
+    Json(value): Json<AppliedForce>,
+) -> Result {
+    Ok(c.call(Command::PutForce(id, value)).await?)
+}
+async fn delete_force(State(c): State<Control>, Path(id): Path<String>, _: EmptyObject) -> Result {
+    Ok(c.call(Command::DeleteForce(id)).await?)
+}
+async fn springs(State(c): State<Control>) -> Result {
+    Ok(c.call(Command::Springs(None)).await?)
+}
+async fn spring(State(c): State<Control>, Path(id): Path<String>) -> Result {
+    Ok(c.call(Command::Springs(Some(id))).await?)
+}
+async fn put_spring(
+    State(c): State<Control>,
+    Path(id): Path<String>,
+    Json(value): Json<Spring>,
+) -> Result {
+    Ok(c.call(Command::PutSpring(id, value)).await?)
+}
+async fn delete_spring(State(c): State<Control>, Path(id): Path<String>, _: EmptyObject) -> Result {
+    Ok(c.call(Command::DeleteSpring(id)).await?)
 }
 
 pub fn start_http(
     listener: TcpListener,
     control: Control,
-    allowed_origins: Vec<HeaderValue>,
-) -> Result<()> {
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([header::CONTENT_TYPE]);
-    let cors = if allowed_origins.iter().any(|origin| origin == "*") {
-        cors.allow_origin(Any)
-    } else {
-        cors.allow_origin(allowed_origins)
-    };
-    let app = Router::new()
-        .route("/state", get(|State(c)| call(c, Ok(AdminRequest::Inspect))))
-        .route(
-            "/configuration",
-            get(|State(c)| call(c, Ok(AdminRequest::Configuration))),
-        )
-        .route("/names", get(|State(c)| call(c, Ok(AdminRequest::Names))))
-        .route(
-            "/reset",
-            post(|State(c), Json(args)| command(c, args, AdminRequest::Reset)),
-        )
-        .route(
-            "/pause",
-            post(|State(c), Json(args)| command(c, args, AdminRequest::Pause)),
-        )
-        .route(
-            "/unpause",
-            post(|State(c), Json(args)| command(c, args, AdminRequest::Unpause)),
-        )
-        .route(
-            "/advance",
-            post(|State(c), Json(args): Json<Map<String, Value>>| {
-                call(
-                    c,
-                    serde_json::from_value(Value::Object(args))
-                        .map(|payload| AdminRequest::Advance { payload })
-                        .map_err(Into::into),
-                )
-            }),
-        )
-        .route(
-            "/fault",
-            post(
-                |State(c), Json((name, args)): Json<(String, Map<String, Value>)>| {
-                    call(
-                        c,
-                        serde_json::from_value(Value::Object(args))
-                            .map(|fault| AdminRequest::Fault {
-                                payload: (name, fault),
-                            })
-                            .map_err(Into::into),
-                    )
-                },
-            ),
-        )
-        .route(
-            "/push",
-            post(|State(c), Json(payload)| call(c, Ok(AdminRequest::Push { payload }))),
-        )
-        .route(
-            "/springs",
-            get(|State(c)| call(c, Ok(AdminRequest::Springs(None)))),
-        )
-        .route(
-            "/springs/{id}",
-            get(|State(c), Path(id)| call(c, Ok(AdminRequest::Springs(Some(id)))))
-                .put(|State(c), Path(id), Json(spring)| {
-                    call(c, Ok(AdminRequest::PutSpring(id, spring)))
-                })
-                .delete(|State(c), Path(id), Json(args)| {
-                    command(c, args, AdminRequest::DeleteSpring(id))
-                }),
-        )
-        .route(
-            "/forces",
-            get(|State(c)| call(c, Ok(AdminRequest::Forces(None)))),
-        )
-        .route(
-            "/forces/{id}",
-            get(|State(c), Path(id)| call(c, Ok(AdminRequest::Forces(Some(id)))))
-                .put(|State(c), Path(id), Json(force)| {
-                    call(c, Ok(AdminRequest::PutForce(id, force)))
-                })
-                .delete(|State(c), Path(id), Json(args)| {
-                    command(c, args, AdminRequest::DeleteForce(id))
-                }),
-        )
-        .layer(DefaultBodyLimit::max(16384))
-        .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(2)))
-        .layer(middleware::from_fn(
-            |request: Request, next: Next| async move {
-                require_json(request.headers())?;
-                Ok::<_, StatusCode>(next.run(request).await)
-            },
-        ))
-        .layer(cors)
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
-        .with_state(control);
+    origins: Vec<HeaderValue>,
+) -> anyhow::Result<()> {
+    let app = router(control, origins);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -206,24 +227,121 @@ pub fn start_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt;
 
     #[test]
-    fn require_json_content_type() {
-        let rejected = Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        for (values, expected) in [
-            (vec!["application/json"], Ok(())),
-            (vec!["Application/JSON; charset=utf-8"], Ok(())),
-            (vec![], rejected),
-            (vec!["text/plain"], rejected),
-            (vec!["application/x-www-form-urlencoded"], rejected),
-            (vec!["multipart/form-data; boundary=test"], rejected),
-            (vec!["application/json", "application/json"], rejected),
-        ] {
-            let mut headers = HeaderMap::new();
-            for value in &values {
-                headers.append(header::CONTENT_TYPE, HeaderValue::from_static(value));
-            }
-            assert_eq!(require_json(&headers), expected, "{values:?}");
-        }
+    fn request_policy_and_cors_configuration() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (control, calls) = Control::channel().unwrap();
+                drop(calls);
+                let app = router(control.clone(), vec![]);
+                // A valid request reaches the unavailable owner; rejected inputs use
+                // Axum's extraction responses or our two application-specific policies.
+                let oversized = " ".repeat(16 * 1024 + 1);
+                for (method, path, content_type, body, status) in [
+                    ("GET", "/state", "", "", 415),
+                    ("POST", "/reset", "text/plain", "{}", 415),
+                    ("GET", "/state", "Application/JSON; charset=utf-8", "", 503),
+                    ("POST", "/reset", "application/json", "{}", 503),
+                    ("POST", "/reset", "application/json", "{", 400),
+                    ("POST", "/reset", "application/json", "{\"extra\":1}", 400),
+                    ("POST", "/reset", "application/json", "[]", 422),
+                    (
+                        "POST",
+                        "/advance",
+                        "application/json",
+                        "{\"duration_ns\":-1}",
+                        422,
+                    ),
+                    (
+                        "POST",
+                        "/advance",
+                        "application/json",
+                        oversized.as_str(),
+                        413,
+                    ),
+                    ("GET", "/missing", "application/json", "", 404),
+                    ("PUT", "/state", "application/json", "{}", 405),
+                ] {
+                    let mut request = Request::builder().method(method).uri(path);
+                    if !content_type.is_empty() {
+                        request = request.header(header::CONTENT_TYPE, content_type);
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status().as_u16(),
+                        status,
+                        "{method} {path} {content_type}"
+                    );
+                }
+
+                let origin = "http://localhost:5173";
+                for (allowed, expected) in [
+                    (vec![], None),
+                    (vec![origin], Some(origin)),
+                    (vec!["*"], Some("*")),
+                ] {
+                    let app = router(
+                        control.clone(),
+                        allowed.into_iter().map(HeaderValue::from_static).collect(),
+                    );
+                    let request = Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri("/reset")
+                        .header(header::ORIGIN, origin)
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                        .body(Body::empty())
+                        .unwrap();
+                    let response = app.clone().oneshot(request).await.unwrap();
+                    assert!(response.status().is_success());
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                            .map(|v| v.to_str().unwrap()),
+                        expected
+                    );
+                    if expected.is_some() {
+                        assert!(
+                            response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
+                                .to_str()
+                                .unwrap()
+                                .contains("POST")
+                        );
+                        assert_eq!(
+                            response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+                            "content-type"
+                        );
+                    }
+                    let response = app
+                        .oneshot(
+                            Request::builder()
+                                .uri("/state")
+                                .header(header::ORIGIN, origin)
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                            .map(|v| v.to_str().unwrap()),
+                        expected
+                    );
+                }
+            });
     }
 }

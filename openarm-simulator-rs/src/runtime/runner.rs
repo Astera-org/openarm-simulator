@@ -1,5 +1,5 @@
 //! Single-threaded simulation/CAN owner. Pausing time never pauses socket I/O.
-use super::{Calls, Clock, Conflict, NotFound, Reply, Request, can};
+use super::{Calls, Clock, Conflict, InvalidRequest, NotFound, Reply, Request, can};
 use crate::{physics::Physics, simulation::Simulation};
 use anyhow::{Context, Result, bail, ensure};
 use damiao_can::MotorStatus;
@@ -9,12 +9,10 @@ use socketcan::CanFdSocket;
 use std::{
     io::{self, Read},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+use tokio::sync::oneshot;
 
 struct Timer(OwnedFd);
 impl Timer {
@@ -132,11 +130,16 @@ fn catch_up(simulation: &mut Simulation, clock: &Clock, stats: &mut Statistics) 
     }
     let count = time_ns / simulation.physics.timestep_ns - stats.steps;
     if count > 0 {
-        simulation.step(count)?;
-        stats.steps += count;
-        stats.max_catchup_steps = stats.max_catchup_steps.max(count);
+        // Return to the event loop between updates, including wall-time catch-up.
+        simulation.step(1)?;
+        stats.steps += 1;
+        stats.max_catchup_steps = stats.max_catchup_steps.max(1);
     }
-    Ok(time_ns)
+    Ok(if count > 1 {
+        stats.steps * simulation.physics.timestep_ns
+    } else {
+        time_ns
+    })
 }
 
 pub fn run(
@@ -149,8 +152,7 @@ pub fn run(
     let timer = Timer::new()?;
     let mut clock = Clock::default();
     let timestep_ns = simulation.physics.timestep_ns;
-    let mut processed_time_ns = 0;
-    let mut advancing: Option<(u64, mpsc::Sender<Result<Reply>>)> = None;
+    let mut advancing: Option<(u64, oneshot::Sender<Result<Reply>>)> = None;
     let mut stats = Statistics::default();
     let mut pollers = [
         timer.0.as_raw_fd(),
@@ -166,7 +168,9 @@ pub fn run(
     })
     .collect::<Vec<_>>();
     while !stopped.load(Ordering::Relaxed) {
-        let timeout = if advancing.is_some() { 0 } else { -1 };
+        let behind =
+            clock.elapsed()?.as_nanos() / u128::from(timestep_ns) > u128::from(stats.steps);
+        let timeout = if advancing.is_some() || behind { 0 } else { -1 };
         let ready = unsafe { libc::poll(pollers.as_mut_ptr(), pollers.len() as _, timeout) };
         if ready < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -204,17 +208,7 @@ pub fn run(
         if pollers[0].revents & libc::POLLIN != 0 {
             timer.drain()?;
         }
-        if let Some((deadline_ns, _)) = &advancing {
-            // Service sockets between complete physics updates. This is not a
-            // synchronization barrier with an external controller's clock.
-            let next_time_ns = if deadline_ns / timestep_ns > stats.steps {
-                (stats.steps + 1) * timestep_ns
-            } else {
-                *deadline_ns
-            };
-            clock.advance(Duration::from_nanos(next_time_ns - processed_time_ns))?;
-        }
-        processed_time_ns = catch_up(simulation, &clock, &mut stats)?;
+        let mut processed_time_ns = catch_up(simulation, &clock, &mut stats)?;
         if advancing
             .as_ref()
             .is_some_and(|(deadline_ns, _)| processed_time_ns == *deadline_ns)
@@ -256,8 +250,9 @@ pub fn run(
                     } else {
                         timer.arm(0, 0)?;
                         clock.pause()?;
-                        processed_time_ns = catch_up(simulation, &clock, &mut stats)?;
-                        Ok(Reply::Done)
+                        let deadline_ns = u64::try_from(clock.elapsed()?.as_nanos())?;
+                        advancing = Some((deadline_ns, reply));
+                        continue;
                     }
                 }
                 Request::Unpause => {
@@ -278,10 +273,11 @@ pub fn run(
                             .context("clock overflow")
                         {
                             Ok(deadline_ns) => {
+                                clock.advance(Duration::from_nanos(payload.duration_ns))?;
                                 advancing = Some((deadline_ns, reply));
                                 continue;
                             }
-                            Err(error) => Err(error),
+                            Err(error) => Err(InvalidRequest(error).into()),
                         }
                     }
                 }
@@ -295,24 +291,28 @@ pub fn run(
                 Request::Forces(id) => {
                     read_resource(simulation.physics.forces(), id).map(Reply::Value)
                 }
-                Request::PutSpring(id, value) => {
-                    simulation.physics.put_spring(id, value).map(|created| {
+                Request::PutSpring(id, value) => simulation
+                    .physics
+                    .put_spring(id, value)
+                    .map_err(|e| InvalidRequest(e).into())
+                    .map(|created| {
                         if created {
                             Reply::Created
                         } else {
                             Reply::Unchanged
                         }
-                    })
-                }
-                Request::PutForce(id, value) => {
-                    simulation.physics.put_force(id, value).map(|created| {
+                    }),
+                Request::PutForce(id, value) => simulation
+                    .physics
+                    .put_force(id, value)
+                    .map_err(|e| InvalidRequest(e).into())
+                    .map(|created| {
                         if created {
                             Reply::Created
                         } else {
                             Reply::Unchanged
                         }
-                    })
-                }
+                    }),
                 Request::DeleteSpring(id) => {
                     simulation.physics.delete_spring(&id);
                     Ok(Reply::Unchanged)
@@ -321,15 +321,17 @@ pub fn run(
                     simulation.physics.delete_force(&id);
                     Ok(Reply::Unchanged)
                 }
-                request => administer(simulation, request).map(|()| {
-                    Reply::State(Box::new(snapshot(
-                        simulation,
-                        processed_time_ns,
-                        clock.paused(),
-                        advancing.is_some(),
-                        &stats,
-                    )))
-                }),
+                request => administer(simulation, request)
+                    .map_err(|e| InvalidRequest(e).into())
+                    .map(|()| {
+                        Reply::State(Box::new(snapshot(
+                            simulation,
+                            processed_time_ns,
+                            clock.paused(),
+                            advancing.is_some(),
+                            &stats,
+                        )))
+                    }),
             };
             let _ = reply.send(result);
         }
@@ -341,4 +343,32 @@ pub fn run(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catch_up_returns_to_event_processing_after_each_update() {
+        let mut simulation = Simulation::new(
+            mujoco::Model::from_xml_bytes(b"<mujoco/>").unwrap(),
+            crate::config::Config::default(),
+        )
+        .unwrap();
+        let period = simulation.physics.timestep_ns;
+        let mut clock = Clock::default();
+        clock.advance(Duration::from_nanos(3 * period + 7)).unwrap();
+        let mut stats = Statistics::default();
+        for step in 1..=3 {
+            let time = catch_up(&mut simulation, &clock, &mut stats).unwrap();
+            assert_eq!(stats.steps, step);
+            assert_eq!(time, step * period + if step == 3 { 7 } else { 0 });
+        }
+        assert_eq!(
+            catch_up(&mut simulation, &clock, &mut stats).unwrap(),
+            3 * period + 7
+        );
+        assert_eq!(stats.steps, 3);
+    }
 }

@@ -21,9 +21,11 @@ signal-hook = "0.3"
 socket2 = { version = "0.6", features = ["all"] }
 socketcan = { version = "4", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "set-header", "timeout"] }
 
 [dev-dependencies]
+openarm-simulator-client = { path = "../openarm-simulator-client-rs" }
 openarm-test-model = { path = "tests/model" }
 tempfile = "3"

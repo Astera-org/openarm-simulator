@@ -736,6 +736,7 @@ dependencies = [
  "libc",
  "mime",
  "mujoco",
+ "openarm-simulator-client",
  "openarm-simulator-core",
  "openarm-test-model",
  "serde",
@@ -746,6 +747,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tower",
  "tower-http",
 ]
 

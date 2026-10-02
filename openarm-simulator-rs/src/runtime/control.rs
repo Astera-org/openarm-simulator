@@ -11,9 +11,10 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
 };
+use tokio::sync::oneshot;
 
 // Bounded messages cross into the physics thread; socket I/O never blocks it.
-type Call = (Request, mpsc::Sender<Result<Reply>>);
+type Call = (Request, oneshot::Sender<Result<Reply>>);
 
 pub enum Reply {
     Names(SceneNames),
@@ -28,6 +29,10 @@ pub enum Reply {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct Conflict(pub &'static str);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidRequest(pub anyhow::Error);
 
 pub struct Calls {
     pub(super) receiver: Receiver<Call>,
@@ -64,8 +69,8 @@ impl Control {
         signal_hook::low_level::pipe::register(signal, self.wake.try_clone()?)?;
         Ok(())
     }
-    pub fn call(&self, request: Request) -> Result<Reply> {
-        let (send, receive) = mpsc::channel();
+    pub async fn call(&self, request: Request) -> Result<Reply> {
+        let (send, receive) = oneshot::channel();
         self.sender
             .try_send((request, send))
             .map_err(|_| Unavailable("simulator busy or stopped"))?;
@@ -77,7 +82,7 @@ impl Control {
         // Do not time out accepted work here while the owner still executes it.
         // Network clients control their own wall-time timeout; no automatic retry.
         receive
-            .recv()
+            .await
             .map_err(|_| Unavailable("simulator stopped"))?
     }
 }
